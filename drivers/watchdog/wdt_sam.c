@@ -99,7 +99,11 @@ static int wdt_sam_disable(const struct device *dev)
 	/* Watchdog Mode register is 'write-once' only register.
 	 * Once disabled, it cannot be enabled until the device is reset
 	 */
+#if 0	// Bringup debug
 	wdt->WDT_MR |= WDT_MR_WDDIS;
+#else
+	wdt->WDT_MR = WDT_MR_WDDIS | WDT_MR_WDV(0xFFF) | WDT_MR_WDD(0xFFF);
+#endif
 	data->mode_set = true;
 
 	return 0;

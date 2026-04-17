@@ -19,7 +19,17 @@ static int bmi270_bus_check_i2c(const union bmi270_bus *bus)
 static int bmi270_reg_read_i2c(const union bmi270_bus *bus,
 			       uint8_t start, uint8_t *data, uint16_t len)
 {
+#if 1
 	return i2c_burst_read_dt(&bus->i2c, start, data, len);
+#else
+	/* BMI270 I2C prepends a dummy byte to all reads */
+	uint8_t buf[len + 1];
+	int ret = i2c_burst_read_dt(&bus->i2c, start, buf, len + 1);
+	if (ret == 0) {
+			memcpy(data, &buf[1], len);
+	}
+	return ret;
+#endif
 }
 
 static int bmi270_reg_write_i2c(const union bmi270_bus *bus, uint8_t start,

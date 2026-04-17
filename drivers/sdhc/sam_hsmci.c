@@ -6,6 +6,7 @@
 
 #define DT_DRV_COMPAT atmel_sam_hsmci
 
+#include <zephyr/sd/sd_spec.h>
 #include <zephyr/drivers/sdhc.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/devicetree.h>
@@ -105,6 +106,7 @@ static int sam_hsmci_get_host_props(const struct device *dev, struct sdhc_host_p
 	props->f_min = _HSMCI_MIN_FREQ;
 	/* high-speed not working yet due to limitations of the SDHC sm */
 	props->host_caps.high_spd_support = false;
+	props->host_caps.vol_330_support = true;
 	props->power_delay = 500;
 	props->is_spi = false;
 	props->max_current_330 = 4;
@@ -293,6 +295,9 @@ static int sam_hsmci_send_cmd(Hsmci *hsmci, struct sdhc_command *cmd, uint32_t c
 
 		if ((sr & _HSMCI_SR_ERR) != 0) {
 			LOG_DBG("Status register error bits: %08x", sr & _HSMCI_SR_ERR);
+			if (sr & HSMCI_SR_RTOE) {
+					return -ETIMEDOUT;
+			}
 			return -EIO;
 		}
 	} while (!(sr & HSMCI_SR_CMDRDY));
@@ -321,6 +326,9 @@ static int sam_hsmci_wait_write_end(Hsmci *hsmci)
 		sr = hsmci->HSMCI_SR;
 		if (sr & (HSMCI_SR_UNRE | HSMCI_SR_OVRE | HSMCI_SR_DTOE | HSMCI_SR_DCRCE)) {
 			LOG_DBG("PDC sr 0x%08x error", sr);
+			if (sr & HSMCI_SR_DTOE) {
+					return -ETIMEDOUT;
+			}
 			return -EIO;
 		}
 	} while (!(sr & HSMCI_SR_TXBUFE));
@@ -330,6 +338,9 @@ static int sam_hsmci_wait_write_end(Hsmci *hsmci)
 		sr = hsmci->HSMCI_SR;
 		if (sr & (HSMCI_SR_UNRE | HSMCI_SR_OVRE | HSMCI_SR_DTOE | HSMCI_SR_DCRCE)) {
 			LOG_DBG("PDC sr 0x%08x last transfer error", sr);
+			if (sr & HSMCI_SR_DTOE) {
+					return -ETIMEDOUT;
+			}
 			return -EIO;
 		}
 	} while (!(sr & HSMCI_SR_NOTBUSY));
@@ -350,6 +361,9 @@ static int sam_hsmci_wait_read_end(Hsmci *hsmci)
 		if (sr & (HSMCI_SR_UNRE | HSMCI_SR_OVRE | HSMCI_SR_DTOE | HSMCI_SR_DCRCE)) {
 			LOG_DBG("PDC sr 0x%08x error", sr & (HSMCI_SR_UNRE | HSMCI_SR_OVRE |
 							     HSMCI_SR_DTOE | HSMCI_SR_DCRCE));
+			if (sr & HSMCI_SR_DTOE) {
+					return -ETIMEDOUT;
+			}
 			return -EIO;
 		}
 	} while (!(sr & HSMCI_SR_RXBUFF));
@@ -358,6 +372,9 @@ static int sam_hsmci_wait_read_end(Hsmci *hsmci)
 	do {
 		sr = hsmci->HSMCI_SR;
 		if (sr & (HSMCI_SR_UNRE | HSMCI_SR_OVRE | HSMCI_SR_DTOE | HSMCI_SR_DCRCE)) {
+			if (sr & HSMCI_SR_DTOE) {
+					return -ETIMEDOUT;
+			}
 			return -EIO;
 		}
 	} while (!(sr & HSMCI_SR_XFRDONE));
@@ -394,6 +411,9 @@ static inline int wait_write_transfer_done(Hsmci *hsmci)
 	do {
 		sr = hsmci->HSMCI_SR;
 		if (sr & (HSMCI_SR_UNRE | HSMCI_SR_OVRE | HSMCI_SR_DTOE | HSMCI_SR_DCRCE)) {
+			if (sr & HSMCI_SR_DTOE) {
+					return -ETIMEDOUT;
+			}
 			return -EIO;
 		}
 	} while (!(sr & HSMCI_SR_TXRDY));
@@ -407,6 +427,9 @@ static inline int wait_read_transfer_done(Hsmci *hsmci)
 	do {
 		sr = hsmci->HSMCI_SR;
 		if (sr & (HSMCI_SR_UNRE | HSMCI_SR_OVRE | HSMCI_SR_DTOE | HSMCI_SR_DCRCE)) {
+			if (sr & HSMCI_SR_DTOE) {
+					return -ETIMEDOUT;
+			}
 			return -EIO;
 		}
 	} while (!(sr & HSMCI_SR_RXRDY));
@@ -531,6 +554,11 @@ static int sam_hsmci_request_inner(const struct device *dev, struct sdhc_command
 		case SD_APP_SEND_NUM_WRITTEN_BLK:
 			is_write = false;
 			break;
+		case MMC_SEND_EXT_CSD:
+            is_write = false;
+            cmdr |= HSMCI_CMDR_TRTYP_SINGLE;
+            cmdr |= HSMCI_CMDR_TRDIR_READ;
+            break;			
 		default:
 			return -ENOTSUP;
 		}
@@ -538,11 +566,11 @@ static int sam_hsmci_request_inner(const struct device *dev, struct sdhc_command
 		if ((sd_data->block_size & 0x3) == 0 && (((uint32_t)sd_data->data) & 0x3) == 0) {
 			size = (sd_data->block_size + 3) >> 2;
 			hsmci->HSMCI_MR &= ~HSMCI_MR_FBYTE;
-			byte_mode = true;
+			byte_mode = false;   /* ← was true, word-aligned = word mode = uint32_t */
 		} else {
 			size = sd_data->block_size;
 			hsmci->HSMCI_MR |= HSMCI_MR_FBYTE;
-			byte_mode = false;
+			byte_mode = true;    /* ← was false, unaligned = byte mode = uint8_t */
 		}
 
 		hsmci->HSMCI_BLKR =

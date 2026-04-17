@@ -663,25 +663,30 @@ static int bmi270_init(const struct device *dev)
 	data->gyr_odr = BMI270_GYR_ODR_200_HZ;
 	data->gyr_range = 2000;
 
-	k_usleep(BMI270_POWER_ON_TIME);
+ k_usleep(BMI270_POWER_ON_TIME);
 
-	ret = bmi270_bus_init(dev);
-	if (ret != 0) {
+    ret = bmi270_bus_init(dev);
+    if (ret != 0) {
 		LOG_ERR("Could not initiate bus communication");
 		return ret;
-	}
+    }
 
-	ret = bmi270_reg_read(dev, BMI270_REG_CHIP_ID, &chip_id, 1);
-	if (ret != 0) {
-		return ret;
-	}
+    /* Dummy read to wake BMI270 from low-power state */
+    bmi270_reg_read(dev, BMI270_REG_CHIP_ID, &chip_id, 1);
+    k_msleep(2);
 
-	if (chip_id != BMI270_CHIP_ID) {
-		LOG_ERR("Unexpected chip id (%x). Expected (%x)",
-			chip_id, BMI270_CHIP_ID);
-		return -EIO;
-	}
-
+    ret = bmi270_reg_read(dev, BMI270_REG_CHIP_ID, &chip_id, 1);
+    if (ret != 0) {
+            LOG_ERR("Chip ID read failed: %d", ret);
+            return ret;
+    }
+    if (chip_id != BMI270_CHIP_ID) {
+            LOG_ERR("Unexpected chip id (0x%02x). Expected (0x%02x)",
+                    chip_id, BMI270_CHIP_ID);
+            return -ENODEV;
+    }
+    LOG_INF("BMI270 chip ID: 0x%02x", chip_id);
+#if 0
 	soft_reset_cmd = BMI270_CMD_SOFT_RESET;
 	ret = bmi270_reg_write(dev, BMI270_REG_CMD, &soft_reset_cmd, 1);
 	if (ret != 0) {
@@ -689,12 +694,23 @@ static int bmi270_init(const struct device *dev)
 	}
 
 	k_usleep(BMI270_SOFT_RESET_TIME);
+#endif
+	/* Recover I2C bus after soft reset — BMI270 may have held bus low */
+	const struct bmi270_config *cfg = dev->config;
+	i2c_recover_bus(cfg->bus.i2c.bus);
+	k_msleep(5);
+	
+    /* Dummy read after soft reset to re-wake I2C interface */
+	bmi270_reg_read(dev, BMI270_REG_CHIP_ID, &chip_id, 1);
+	k_msleep(2);
 
 	ret = bmi270_reg_read(dev, BMI270_REG_PWR_CONF, &adv_pwr_save, 1);
 	if (ret != 0) {
+		LOG_ERR("PWR_CONF read failed: %d", ret);
 		return ret;
 	}
-
+	LOG_INF("PWR_CONF = 0x%02x", adv_pwr_save);	
+	
 	adv_pwr_save = BMI270_SET_BITS_POS_0(adv_pwr_save,
 					     BMI270_PWR_CONF_ADV_PWR_SAVE,
 					     BMI270_PWR_CONF_ADV_PWR_SAVE_DIS);
@@ -708,12 +724,15 @@ static int bmi270_init(const struct device *dev)
 	init_ctrl = BMI270_PREPARE_CONFIG_LOAD;
 	ret = bmi270_reg_write(dev, BMI270_REG_INIT_CTRL, &init_ctrl, 1);
 	if (ret != 0) {
+		LOG_ERR("INIT_CTRL prepare failed: %d", ret);
 		return ret;
 	}
-
+	LOG_INF("Starting config file write...");
+	
 	ret = write_config_file(dev);
 
 	if (ret != 0) {
+		LOG_ERR("Config file write failed: %d", ret);
 		return ret;
 	}
 
@@ -722,7 +741,8 @@ static int bmi270_init(const struct device *dev)
 	if (ret != 0) {
 		return ret;
 	}
-
+	LOG_INF("Config file write complete");
+	
 	/* Timeout after BMI270_CONFIG_FILE_RETRIES x
 	 * BMI270_CONFIG_FILE_POLL_PERIOD_US microseconds.
 	 * If tries is BMI270_CONFIG_FILE_RETRIES by the end of the loop,
@@ -746,6 +766,12 @@ static int bmi270_init(const struct device *dev)
 		return -EIO;
 	}
 
+	/* Dummy read after config load to stabilize I2C interface */
+	bmi270_reg_read(dev, BMI270_REG_CHIP_ID, &chip_id, 1);
+	k_msleep(2);
+
+	LOG_INF("BMI270 init complete");
+	
 #if CONFIG_BMI270_TRIGGER
 	ret = bmi270_init_interrupts(dev);
 	if (ret) {
@@ -753,14 +779,14 @@ static int bmi270_init(const struct device *dev)
 		return ret;
 	}
 #endif
-
+#if 0	/* Do not re-enable ADV_PWR_SAVE — causes I2C timeouts on SAME70 TWIHS */
 	adv_pwr_save = BMI270_SET_BITS_POS_0(adv_pwr_save,
 					     BMI270_PWR_CONF_ADV_PWR_SAVE,
 					     BMI270_PWR_CONF_ADV_PWR_SAVE_EN);
 	ret = bmi270_reg_write_with_delay(dev, BMI270_REG_PWR_CONF,
 					  &adv_pwr_save, 1,
 					  BMI270_INTER_WRITE_DELAY_US);
-
+#endif
 	return ret;
 }
 

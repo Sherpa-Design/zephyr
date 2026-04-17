@@ -110,10 +110,19 @@ static int i2c_sam_twihs_configure(const struct device *dev, uint32_t config)
 	uint32_t bitrate;
 	int ret;
 
+#if 1	// Bringup Debug
 	if (!(config & I2C_MODE_CONTROLLER)) {
 		LOG_ERR("Master Mode is not enabled");
 		return -EIO;
 	}
+#else
+	if (!(config & I2C_MODE_CONTROLLER)) {
+        printk("*** TWIHS config=0x%08X I2C_MODE_CONTROLLER=0x%08X\n",
+               config, (uint32_t)I2C_MODE_CONTROLLER);
+        LOG_ERR("Master Mode is not enabled");
+        return -EIO;
+	}	
+#endif
 
 	if (config & I2C_ADDR_10_BITS) {
 		LOG_ERR("I2C 10-bit addressing is currently not supported");
@@ -219,8 +228,18 @@ static int i2c_sam_twihs_transfer(const struct device *dev,
 			write_msg_start(twihs, &dev_data->msg, addr);
 		}
 		/* Wait for the transfer to complete */
+#if 0
 		k_sem_take(&dev_data->sem, K_FOREVER);
-
+#else
+		/* Wait for the transfer to complete */
+		if (k_sem_take(&dev_data->sem, K_MSEC(100)) != 0) {
+				/* Timeout — reset the bus */
+				LOG_ERR("I2C transfer timeout, recovering bus");
+				twihs->TWIHS_CR = TWIHS_CR_SWRST;
+				k_sem_give(&dev_data->lock);
+				return -ETIMEDOUT;
+		}	
+#endif
 		if (dev_data->msg.twihs_sr > 0) {
 			/* Something went wrong */
 			ret = -EIO;

@@ -142,11 +142,19 @@ extern void atmel_samx7x_config(void);
  */
 void soc_early_init_hook(void)
 {
-	/* Check that the CHIP CIDR matches the HAL one */
-	if (CHIPID->CHIPID_CIDR != CHIP_CIDR) {
-		LOG_WRN("CIDR mismatch: chip = 0x%08x vs HAL = 0x%08x",
-			(uint32_t)CHIPID->CHIPID_CIDR, (uint32_t)CHIP_CIDR);
-	}
+        /* Disable WDT immediately at reset before any driver touches it.
+         * Hardware default WDT_MR = 0x00010300 (3s timeout, reset enabled).
+         * WDT_MR is write-once per power cycle - must be done here before
+         * the Zephyr WDT driver PRE_KERNEL_1 init runs.
+         * Application re-arms WDT via health_mon after storage mounts.
+         */
+        WDT->WDT_MR = WDT_MR_WDDIS | WDT_MR_WDV(0xFFF) | WDT_MR_WDD(0xFFF);
 
-	atmel_samx7x_config();
+        /* Check that the CHIP CIDR matches the HAL one */
+        if (CHIPID->CHIPID_CIDR != CHIP_CIDR) {
+                LOG_WRN("CIDR mismatch: chip = 0x%08x vs HAL = 0x%08x",
+                        (uint32_t)CHIPID->CHIPID_CIDR, (uint32_t)CHIP_CIDR);
+        }
+        atmel_samx7x_config();
 }
+
