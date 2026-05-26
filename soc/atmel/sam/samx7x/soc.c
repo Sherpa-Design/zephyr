@@ -116,10 +116,19 @@ void soc_reset_hook(void)
 	}
 
 	/*
-	 * DTCM is enabled by default at reset, therefore we have to disable
-	 * it first to get the caches into a state where then the
-	 * sys_cache*-functions can enable them, if requested by the
-	 * configuration.
+	 * Enable DTCM and ITCM.  soc_prep_hook() (called from z_prep_c just
+	 * before arch_bss_zero) also enables them; this call is a belt-and-
+	 * suspenders duplicate that ensures TCM is live even if the prep hook
+	 * ordering ever changes.  ARM TRM requires DSB+ISB after enabling TCM.
+	 */
+	SCB->DTCMCR |= SCB_DTCMCR_EN_Msk;
+	SCB->ITCMCR |= SCB_ITCMCR_EN_Msk;
+	__DSB();
+	__ISB();
+
+	/*
+	 * D-cache is enabled by default at reset; disable and re-enable it
+	 * cleanly so sys_cache_*_enable() starts from a known state.
 	 */
 	SCB_InvalidateDCache();
 	SCB_DisableDCache();
@@ -134,6 +143,23 @@ void soc_reset_hook(void)
 	clock_init();
 }
 
+/**
+ * @brief Enable TCM immediately before arch_bss_zero() runs.
+ *
+ * Called from z_prep_c() before arch_bss_zero().  arch_bss_zero() writes
+ * to __dtcm_bss_start (0x20000000) when DT_CHOSEN(zephyr_dtcm) is defined.
+ * On samx7x that address is unmapped until DTCM is enabled, causing a bus
+ * fault.  soc_reset_hook() also enables TCM earlier, but soc_prep_hook()
+ * is the guaranteed last call-site before the first DTCM write.
+ */
+void soc_prep_hook(void)
+{
+	SCB->DTCMCR |= SCB_DTCMCR_EN_Msk;
+	SCB->ITCMCR |= SCB_ITCMCR_EN_Msk;
+	__DSB();
+	__ISB();
+}
+
 extern void atmel_samx7x_config(void);
 /**
  * @brief Perform basic hardware initialization at boot.
@@ -142,19 +168,39 @@ extern void atmel_samx7x_config(void);
  */
 void soc_early_init_hook(void)
 {
-        /* Disable WDT immediately at reset before any driver touches it.
-         * Hardware default WDT_MR = 0x00010300 (3s timeout, reset enabled).
-         * WDT_MR is write-once per power cycle - must be done here before
-         * the Zephyr WDT driver PRE_KERNEL_1 init runs.
-         * Application re-arms WDT via health_mon after storage mounts.
-         */
-        WDT->WDT_MR = WDT_MR_WDDIS | WDT_MR_WDV(0xFFF) | WDT_MR_WDD(0xFFF);
+	/* Disable WDT immediately at reset before any driver touches it.
+	 * Hardware default WDT_MR = 0x00010300 (3s timeout, reset enabled).
+	 * WDT_MR is write-once per power cycle — must be done here before
+	 * the Zephyr WDT driver PRE_KERNEL_1 init runs.
+	 */
+	WDT->WDT_MR = WDT_MR_WDDIS | WDT_MR_WDV(0xFFF) | WDT_MR_WDD(0xFFF);
 
-        /* Check that the CHIP CIDR matches the HAL one */
-        if (CHIPID->CHIPID_CIDR != CHIP_CIDR) {
-                LOG_WRN("CIDR mismatch: chip = 0x%08x vs HAL = 0x%08x",
-                        (uint32_t)CHIPID->CHIPID_CIDR, (uint32_t)CHIP_CIDR);
-        }
-        atmel_samx7x_config();
+	/* S-06: Cortex-M7 AHBS arbitration — favour DMA over CPU for TCM.
+	 * CM7_AHBSCR @ 0xE000EFA0:
+	 *   CTL=0b10  priority-aware demotion (AHBS demoted only when CPU
+	 *             execution priority < TPRI threshold)
+	 *   TPRI=0x40 demote AHBS only when CPU is below priority 0x40
+	 *             (ISRs at priority < 0x40 still win arbitration)
+	 *   INITCOUNT=1 round-robin fairness when not demoted
+	 * Combined value: 0x00000902  (TRM rev F section 5.7.3)
+	 */
+	*((volatile uint32_t *)0xE000EFA0) = 0x00000902;
+
+	/* S-06: Errata DS80000767M §2.22.1 — set RSTC_MR.ERSTL >= 1 to
+	 * prevent infinite WDT-reset loop on external reset assertion.
+	 */
+	RSTC->RSTC_MR = RSTC_MR_KEY_PASSWD | RSTC_MR_ERSTL(1);
+
+	/* Check that the CHIP CIDR matches the HAL one */
+	#ifdef CONFIG_BOARD_EXPECTED_CIDR
+		uint32_t expected = CONFIG_BOARD_EXPECTED_CIDR;
+	#else
+		uint32_t expected = CHIP_CIDR;
+	#endif
+	if (CHIPID->CHIPID_CIDR != expected) {
+		LOG_WRN("CIDR mismatch: chip = 0x%08x vs HAL = 0x%08x",
+			(uint32_t)CHIPID->CHIPID_CIDR, expected);
+	}
+	atmel_samx7x_config();
 }
 

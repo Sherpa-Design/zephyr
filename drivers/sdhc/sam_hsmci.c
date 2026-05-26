@@ -12,10 +12,26 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/kernel.h>
+#include <zephyr/sys/atomic.h>
 #include <soc.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/clock_control/atmel_sam_pmc.h>
+
+/* S-01b: per-command-type counters for BCC throughput analysis */
+static atomic_t s_cmd17_count;  /* SD_READ_SINGLE_BLOCK  */
+static atomic_t s_cmd18_count;  /* SD_READ_MULTIPLE_BLOCK */
+static atomic_t s_cmd24_count;  /* SD_WRITE_SINGLE_BLOCK  */
+static atomic_t s_cmd25_count;  /* SD_WRITE_MULTIPLE_BLOCK */
+
+void sam_hsmci_get_cmd_counts(uint32_t *c17, uint32_t *c18,
+			      uint32_t *c24, uint32_t *c25)
+{
+	*c17 = (uint32_t)atomic_get(&s_cmd17_count);
+	*c18 = (uint32_t)atomic_get(&s_cmd18_count);
+	*c24 = (uint32_t)atomic_get(&s_cmd24_count);
+	*c25 = (uint32_t)atomic_get(&s_cmd25_count);
+}
 
 LOG_MODULE_REGISTER(hsmci, CONFIG_SDHC_LOG_LEVEL);
 
@@ -74,7 +90,17 @@ struct sam_hsmci_data {
 	bool open_drain;
 	uint8_t cmd_in_progress;
 	struct k_mutex mtx;
+	/* S-01b BM: when true, bypass PDC and use CPU-polled transfer */
+	bool force_manual;
 };
+
+void sam_hsmci_set_force_manual(bool enable)
+{
+	const struct device *dev = DEVICE_DT_GET(DT_NODELABEL(hsmci));
+	struct sam_hsmci_data *d = dev->data;
+
+	d->force_manual = enable;
+}
 
 static int sam_hsmci_reset(const struct device *dev)
 {
@@ -339,6 +365,8 @@ static int sam_hsmci_wait_write_end(Hsmci *hsmci)
 		if (sr & (HSMCI_SR_UNRE | HSMCI_SR_OVRE | HSMCI_SR_DTOE | HSMCI_SR_DCRCE)) {
 			LOG_DBG("PDC sr 0x%08x last transfer error", sr);
 			if (sr & HSMCI_SR_DTOE) {
+					LOG_WRN("DTOE SR=0x%08x NOTBUSY=%d",
+						sr, (sr & HSMCI_SR_NOTBUSY) ? 1 : 0);
 					return -ETIMEDOUT;
 			}
 			return -EIO;
@@ -530,11 +558,13 @@ static int sam_hsmci_request_inner(const struct device *dev, struct sdhc_command
 
 		switch (cmd->opcode) {
 		case SD_WRITE_SINGLE_BLOCK:
+			atomic_inc(&s_cmd24_count);
 			cmdr |= HSMCI_CMDR_TRTYP_SINGLE;
 			cmdr |= HSMCI_CMDR_TRDIR_WRITE;
 			is_write = true;
 			break;
 		case SD_WRITE_MULTIPLE_BLOCK:
+			atomic_inc(&s_cmd25_count);
 			is_write = true;
 			cmdr |= HSMCI_CMDR_TRTYP_MULTIPLE;
 			cmdr |= HSMCI_CMDR_TRDIR_WRITE;
@@ -542,11 +572,13 @@ static int sam_hsmci_request_inner(const struct device *dev, struct sdhc_command
 		case SD_APP_SEND_SCR:
 		case SD_SWITCH:
 		case SD_READ_SINGLE_BLOCK:
+			atomic_inc(&s_cmd17_count);
 			is_write = false;
 			cmdr |= HSMCI_CMDR_TRTYP_SINGLE;
 			cmdr |= HSMCI_CMDR_TRDIR_READ;
 			break;
 		case SD_READ_MULTIPLE_BLOCK:
+			atomic_inc(&s_cmd18_count);
 			is_write = false;
 			cmdr |= HSMCI_CMDR_TRTYP_MULTIPLE;
 			cmdr |= HSMCI_CMDR_TRDIR_READ;
@@ -579,17 +611,22 @@ static int sam_hsmci_request_inner(const struct device *dev, struct sdhc_command
 		transfer_count = size * sd_data->blocks;
 
 #ifdef _HSMCI_PDCMODE
-		hsmci->HSMCI_MR |= HSMCI_MR_PDCMODE;
+		/* S-01b BM: skip PDC when force_manual is set */
+		if (!data->force_manual) {
+			hsmci->HSMCI_MR |= HSMCI_MR_PDCMODE;
 
-		hsmci->HSMCI_RNCR = 0;
+			hsmci->HSMCI_RNCR = 0;
 
-		if (is_write) {
-			hsmci->HSMCI_TCR = transfer_count;
-			hsmci->HSMCI_TPR = (uint32_t)sd_data->data;
+			if (is_write) {
+				hsmci->HSMCI_TCR = transfer_count;
+				hsmci->HSMCI_TPR = (uint32_t)sd_data->data;
+			} else {
+				hsmci->HSMCI_RCR = transfer_count;
+				hsmci->HSMCI_RPR = (uint32_t)sd_data->data;
+				hsmci->HSMCI_PTCR = HSMCI_PTCR_RXTEN;
+			}
 		} else {
-			hsmci->HSMCI_RCR = transfer_count;
-			hsmci->HSMCI_RPR = (uint32_t)sd_data->data;
-			hsmci->HSMCI_PTCR = HSMCI_PTCR_RXTEN;
+			hsmci->HSMCI_MR &= ~HSMCI_MR_PDCMODE;
 		}
 
 	} else {
@@ -601,16 +638,24 @@ static int sam_hsmci_request_inner(const struct device *dev, struct sdhc_command
 
 	if (sd_data) {
 #ifdef _HSMCI_PDCMODE
-		if (ret == 0) {
-			if (is_write) {
-				hsmci->HSMCI_PTCR = HSMCI_PTCR_TXTEN;
-				ret = sam_hsmci_wait_write_end(hsmci);
-			} else {
-				ret = sam_hsmci_wait_read_end(hsmci);
+		if (!data->force_manual) {
+			if (ret == 0) {
+				if (is_write) {
+					hsmci->HSMCI_PTCR = HSMCI_PTCR_TXTEN;
+					ret = sam_hsmci_wait_write_end(hsmci);
+				} else {
+					ret = sam_hsmci_wait_read_end(hsmci);
+				}
+			}
+			hsmci->HSMCI_PTCR = HSMCI_PTCR_TXTDIS | HSMCI_PTCR_RXTDIS;
+			hsmci->HSMCI_MR &= ~HSMCI_MR_PDCMODE;
+		} else {
+			/* S-01b BM: manual path for DMA-vs-CPU comparison */
+			if (ret == 0) {
+				ret = hsmci_do_manual_transfer(hsmci, byte_mode, is_write,
+							       sd_data->data, transfer_count);
 			}
 		}
-		hsmci->HSMCI_PTCR = HSMCI_PTCR_TXTDIS | HSMCI_PTCR_RXTDIS;
-		hsmci->HSMCI_MR &= ~HSMCI_MR_PDCMODE;
 #else  /* !_HSMCI_PDCMODE */
 		if (ret == 0) {
 			ret = hsmci_do_manual_transfer(hsmci, byte_mode, is_write, sd_data->data,
@@ -645,7 +690,6 @@ static int sam_hsmci_request(const struct device *dev, struct sdhc_command *cmd,
 			     struct sdhc_data *sd_data)
 {
 	struct sam_hsmci_data *dev_data = dev->data;
-	int busy_timeout = _HSMCI_DEFAULT_TIMEOUT;
 	int ret;
 
 	ret = k_mutex_lock(&dev_data->mtx, K_MSEC(cmd->timeout_ms));
@@ -665,16 +709,41 @@ static int sam_hsmci_request(const struct device *dev, struct sdhc_command *cmd,
 		ret = sam_hsmci_request_inner(dev, cmd, sd_data);
 		if (sd_data && (ret || sd_data->blocks > 1)) {
 			sam_hsmci_abort(dev);
-			while (busy_timeout > 0) {
+			/* Post-CMD12 busy wait. Erase-boundary writes can hold DAT0 low
+			 * for several seconds on some eMMC chips — longer than the
+			 * hardware DTOR limit (~629ms at 25 MHz). Use wall-clock timeout
+			 * with msleep so the CPU is not monopolised. Minimum 30 s floor
+			 * covers worst-case erase latencies. */
+			int busy_ms = cmd->timeout_ms > 30000 ? cmd->timeout_ms : 30000;
+			int64_t t0 = k_uptime_get();
+			int64_t deadline = t0 + busy_ms;
+			int64_t log_next = t0 + 1000;
+			bool card_idle = false;
+			const struct sam_hsmci_config *cfg = dev->config;
+
+			while (k_uptime_get() < deadline) {
 				if (!sam_hsmci_card_busy(dev)) {
+					card_idle = true;
 					break;
 				}
-				k_busy_wait(125);
-				busy_timeout -= 125;
+				if (k_uptime_get() >= log_next) {
+					uint32_t sr_now = cfg->base->HSMCI_SR;
+					LOG_WRN("busy wait +%u ms SR=0x%08x NOTBUSY=%d",
+						(uint32_t)(k_uptime_get() - t0),
+						sr_now,
+						(sr_now & HSMCI_SR_NOTBUSY) ? 1 : 0);
+					log_next += 5000;
+				}
+				k_msleep(1);
 			}
-			if (busy_timeout <= 0) {
+			if (!card_idle) {
 				LOG_ERR("Card did not idle after CMD12");
 				ret = -ETIMEDOUT;
+			} else if (ret == -ETIMEDOUT) {
+				/* DTOE fired during post-transfer busy wait; all data was
+				 * transferred to the card before the hardware timeout, so
+				 * the write completed successfully once the card went idle. */
+				ret = 0;
 			}
 		}
 	} while (ret != 0 && (cmd->retries-- > 0));

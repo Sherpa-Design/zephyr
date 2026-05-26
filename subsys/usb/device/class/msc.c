@@ -175,7 +175,12 @@ static volatile uint32_t defered_wr_sz;
  * Align for cases where the underlying disk access requires word-aligned
  * addresses.
  */
-static uint8_t __aligned(4) page[BLOCK_SIZE + CONFIG_MASS_STORAGE_BULK_EP_MPS];
+/* MSD bounce buffer in DTCM — non-cacheable, no cache maintenance required.
+ * Erratum DS80000767M §2.5.1: TCM DMA buffers must be 32-bit aligned. */
+BUILD_ASSERT(((BLOCK_SIZE + CONFIG_MASS_STORAGE_BULK_EP_MPS) % 4) == 0,
+	     "MSD page buffer size must be a multiple of 4 bytes");
+static uint8_t __aligned(4) __attribute__((section(".dtcm_bss")))
+	page[BLOCK_SIZE + CONFIG_MASS_STORAGE_BULK_EP_MPS];
 
 /* Initialized during mass_storage_init() */
 static uint32_t block_count;

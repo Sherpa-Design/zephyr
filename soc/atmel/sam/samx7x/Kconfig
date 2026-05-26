@@ -14,6 +14,7 @@ config SOC_SERIES_SAMX7X
 	select CPU_HAS_DCACHE
 	select INIT_ARCH_HW_AT_BOOT
 	select SOC_RESET_HOOK
+	select SOC_PREP_HOOK
 	select HAS_SWO
 	select XIP
 	select HAS_POWEROFF
