@@ -588,12 +588,21 @@ SCSI_CMD_HANDLER(MODE_SENSE_6)
 {
 	struct scsi_mode_sense_6_response r;
 	int length;
+	uint8_t page_code = cmd->page & 0x3F; /* strip PC bits 7:6 */
 
 	ctx->cmd_is_data_read = true;
 
-	if (cmd->page != MODE_SENSE_PAGE_CODE_ALL_PAGES || cmd->subpage != 0) {
+	/* Return the minimal 4-byte parameter header (no block descriptors,
+	 * no mode pages) for any page request.  Specific pages we do not
+	 * implement are answered with an empty header rather than ILLEGAL
+	 * REQUEST, which causes Windows to retry indefinitely.
+	 * Subpage != 0 is genuinely unsupported. */
+	if (cmd->subpage != 0) {
 		return illegal_request(ctx, INVALID_FIELD_IN_CDB);
 	}
+
+	LOG_DBG("MODE_SENSE_6 page=0x%02x alloc=%u", page_code,
+		cmd->allocation_length);
 
 	r.mode_data_length = 3;
 	r.medium_type = 0x00;
@@ -820,12 +829,16 @@ SCSI_CMD_HANDLER(MODE_SENSE_10)
 {
 	struct scsi_mode_sense_10_response r;
 	int length;
+	uint8_t page_code = cmd->page & 0x3F; /* strip PC bits 7:6 */
 
 	ctx->cmd_is_data_read = true;
 
-	if (cmd->page != MODE_SENSE_PAGE_CODE_ALL_PAGES || cmd->subpage != 0) {
+	if (cmd->subpage != 0) {
 		return illegal_request(ctx, INVALID_FIELD_IN_CDB);
 	}
+
+	LOG_DBG("MODE_SENSE_10 page=0x%02x alloc=%u", page_code,
+		sys_be16_to_cpu(cmd->allocation_length));
 
 	r.mode_data_length = sys_cpu_to_be16(6);
 	r.medium_type = 0x00;

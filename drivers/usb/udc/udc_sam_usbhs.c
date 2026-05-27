@@ -418,11 +418,15 @@ static int sam_usbhs_prep_out(const struct device *dev,
 		nbusybk, dtseq);
 
 	/*
-	 * Clear FIFOCON to release any previously held bank and make it
-	 * available for the host to write. For EP0 this is handled differently
-	 * (single bank, no FIFOCON management needed).
+	 * Release any previously held bank so the host can write new data.
+	 * EP0 uses single-bank mode without FIFOCON management.
+	 *
+	 * Guard: skip the release when RXOUI is already set, which means data
+	 * arrived while no buffer was queued (ISR deferred via out_pending).
+	 * Writing FIFOCONC in that case would discard the received packet before
+	 * sam_usbhs_process_pending_out or the re-armed ISR can drain it.
 	 */
-	if (ep_idx != 0) {
+	if (ep_idx != 0 && !(isr & USBHS_DEVEPTISR_RXOUTI)) {
 		base->USBHS_DEVEPTIDR[ep_idx] = USBHS_DEVEPTIDR_FIFOCONC;
 	}
 
@@ -928,19 +932,18 @@ static void sam_usbhs_isr_handler(const struct device *dev)
 		/* Disable WAKEUP, enable SUSP to detect next suspend */
 		base->USBHS_DEVIDR = USBHS_DEVIDR_WAKEUPEC;
 		base->USBHS_DEVIER = USBHS_DEVIER_SUSPES;
-		LOG_DBG("USB Wakeup ISR");
+		LOG_WRN("USB Wakeup ISR suspended=%d SR=0x%08x",
+			(int)udc_is_suspended(dev), base->USBHS_SR);
 		if (udc_is_suspended(dev)) {
-			LOG_DBG("USB Wakeup");
 			udc_set_suspended(dev, false);
 			udc_submit_event(dev, UDC_EVT_RESUME, 0);
 		}
 	}
 
 	if (sr & USBHS_DEVISR_EORSM) {
-		LOG_DBG("USB End Of Resume ISR");
 		base->USBHS_DEVICR = USBHS_DEVICR_EORSMC;
+		LOG_WRN("USB EORSM ISR suspended=%d", (int)udc_is_suspended(dev));
 		if (udc_is_suspended(dev)) {
-			LOG_DBG("USB Resume");
 			udc_set_suspended(dev, false);
 			udc_submit_event(dev, UDC_EVT_RESUME, 0);
 		}
@@ -948,7 +951,8 @@ static void sam_usbhs_isr_handler(const struct device *dev)
 
 	if (sr & USBHS_DEVISR_EORST) {
 		base->USBHS_DEVICR = USBHS_DEVICR_EORSTC;
-		LOG_DBG("USB Reset");
+		LOG_WRN("USB EORST ISR SR=0x%08x DEVIMR=0x%08x",
+			base->USBHS_SR, base->USBHS_DEVIMR);
 
 		/*
 		 * The device clears some of the configuration of EP0
@@ -961,13 +965,13 @@ static void sam_usbhs_isr_handler(const struct device *dev)
 	}
 
 	if (sr & USBHS_DEVISR_SUSP) {
-		LOG_DBG("USB Suspend ISR");
 		base->USBHS_DEVICR = USBHS_DEVICR_SUSPC;
 		/* Disable SUSP, enable WAKEUP to detect resume */
 		base->USBHS_DEVIDR = USBHS_DEVIDR_SUSPEC;
 		base->USBHS_DEVIER = USBHS_DEVIER_WAKEUPES;
+		LOG_WRN("USB SUSP ISR already_susp=%d SR=0x%08x",
+			(int)udc_is_suspended(dev), base->USBHS_SR);
 		if (!udc_is_suspended(dev)) {
-			LOG_DBG("USB Suspend");
 			udc_set_suspended(dev, true);
 			udc_submit_event(dev, UDC_EVT_SUSPEND, 0);
 		}
@@ -1220,6 +1224,9 @@ static int udc_sam_usbhs_ep_enable(const struct device *dev,
 			ep_idx, base->USBHS_DEVEPTCFG[ep_idx]);
 		return -EINVAL;
 	}
+
+	/* Hardware reset cleared any physical halt; sync the software flag. */
+	ep_cfg->stat.halted = false;
 
 	LOG_DBG("EP%d after enable: CFG=0x%08x ISR=0x%08x",
 		ep_idx, base->USBHS_DEVEPTCFG[ep_idx], base->USBHS_DEVEPTISR[ep_idx]);

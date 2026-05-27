@@ -271,11 +271,13 @@ static void msc_stall_bulk_in_ep(struct usbd_class_data *const c_data)
 	uint8_t ep;
 
 	ep = msc_get_bulk_in(c_data);
+	LOG_WRN("stall bulk IN ep 0x%02x", ep);
 	usbd_ep_set_halt(usbd_class_get_ctx(c_data), ep);
 }
 
 static void msc_stall_and_wait_for_recovery(struct msc_bot_ctx *ctx)
 {
+	LOG_WRN("stall_and_wait_for_recovery");
 	atomic_set_bit(&ctx->bits, MSC_BULK_IN_WEDGED);
 	atomic_set_bit(&ctx->bits, MSC_BULK_OUT_WEDGED);
 	msc_stall_bulk_in_ep(ctx->class_node);
@@ -456,12 +458,18 @@ static void msc_process_cbw(struct msc_bot_ctx *ctx)
 	/* All SCSI buffers must be available */
 	__ASSERT_NO_MSG(ctx->scsi_bufs_used == 0);
 
+	LOG_INF("CBW cmd=0x%02x flags=0x%02x xfer_len=%u",
+		ctx->cbw.CBWCB[0], ctx->cbw.bmCBWFlags,
+		ctx->cbw.dCBWDataTransferLength);
+
 	cb_len = scsi_usb_boot_cmd_len(ctx->cbw.CBWCB, ctx->cbw.bCBWCBLength);
 	data_len = scsi_cmd(lun, ctx->cbw.CBWCB, cb_len, ctx->scsi_bufs[0]);
 	ctx->scsi_bytes = data_len;
 	cmd_is_data_read = scsi_cmd_is_data_read(lun);
 	cmd_is_data_write = scsi_cmd_is_data_write(lun);
 	data_len += scsi_cmd_remaining_data_len(lun);
+	LOG_INF("CBW result: data_len=%zu is_read=%d is_write=%d",
+		data_len, (int)cmd_is_data_read, (int)cmd_is_data_write);
 
 	/* Write commands must not return any data to initiator (host) */
 	__ASSERT_NO_MSG(cmd_is_data_read || ctx->scsi_bytes == 0);
@@ -602,7 +610,9 @@ static void msc_handle_bulk_out(struct msc_bot_ctx *ctx,
 			}
 		} else {
 			/* 6.6.1 CBW Not Valid */
-			LOG_INF("Invalid CBW");
+			LOG_WRN("Invalid CBW len=%u sig=0x%08x (want len=%u sig=0x%08x)",
+				(unsigned)len, (unsigned)sys_get_le32(buf),
+				(unsigned)sizeof(struct CBW), CBW_SIGNATURE);
 			msc_stall_and_wait_for_recovery(ctx);
 		}
 	} else if (ctx->state == MSC_BBB_PROCESS_WRITE) {
@@ -621,11 +631,14 @@ static void msc_handle_bulk_in(struct msc_bot_ctx *ctx,
 
 		ctx->transferred_data += len;
 		if (msc_next_in_transfer_length(ctx->class_node) == 0) {
-			if (ctx->csw.dCSWDataResidue > 0) {
-				/* Case (5) Hi > Di
-				 * While we may have sent short packet, device
-				 * shall STALL the Bulk-In pipe (if it does not
-				 * send padding data).
+			if (ctx->csw.dCSWDataResidue > 0 &&
+			    len >= USBD_MAX_BULK_MPS) {
+				/* Case (5) Hi > Di, last TX was a full-size
+				 * packet: host cannot detect EOD from the
+				 * packet size, so stall bulk-IN to signal it.
+				 * Short packets (len < MPS) already signal EOD
+				 * implicitly; stalling there prevents Windows
+				 * from clearing the halt and reading the CSW.
 				 */
 				msc_stall_bulk_in_ep(ctx->class_node);
 			}
@@ -788,6 +801,9 @@ static void msc_bot_feature_halt(struct usbd_class_data *const c_data,
 				 const uint8_t ep, const bool halted)
 {
 	struct msc_bot_ctx *ctx = usbd_class_get_private(c_data);
+	LOG_WRN("feature_halt ep=0x%02x halted=%d IN_WEDGED=%d",
+		ep, (int)halted,
+		(int)atomic_test_bit(&ctx->bits, MSC_BULK_IN_WEDGED));
 
 	if (ep == msc_get_bulk_in(c_data) && !halted &&
 	    atomic_test_bit(&ctx->bits, MSC_BULK_IN_WEDGED)) {
