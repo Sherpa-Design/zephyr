@@ -22,3 +22,11 @@ properties:
 
   cd-gpios:
     type: phandle-array
+
+  dmas:
+    type: phandle-array
+    description: Optional XDMAC channel for HSMCI data transfers (channel perid).
+
+  dma-names:
+    type: string-array
+    description: DMA logical name, must be "rxtx".

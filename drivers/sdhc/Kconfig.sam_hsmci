@@ -18,6 +18,18 @@ config SAM_HSMCI_PDCMODE
 	help
 	  Use peripheral DMA controller, if supported
 
+config SAM_HSMCI_XDMAC
+	bool "Use XDMAC for HSMCI data transfers (SAMX7X)"
+	depends on !SAM_HSMCI_PDCMODE
+	depends on DMA
+	select CACHE_MANAGEMENT
+	default y if SOC_SERIES_SAMX7X
+	help
+	  Replace the CPU-polled FIFO loop with XDMAC hardware-handshaked
+	  transfers. Required for throughput above ~2 MB/s on SAMX7X (which
+	  removed the PDC present on SAM4). Set n to fall back to the manual
+	  transfer loop for debugging.
+
 config SAM_HSMCI_PWRSAVE
 	bool "Power save during card inactive"
 	default y

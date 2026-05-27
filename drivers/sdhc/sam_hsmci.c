@@ -17,6 +17,10 @@
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/clock_control/atmel_sam_pmc.h>
+#ifdef CONFIG_SAM_HSMCI_XDMAC
+#include <zephyr/drivers/dma.h>
+#include <zephyr/cache.h>
+#endif
 
 /* S-01b: per-command-type counters for BCC throughput analysis */
 static atomic_t s_cmd17_count;  /* SD_READ_SINGLE_BLOCK  */
@@ -84,14 +88,23 @@ struct sam_hsmci_config {
 	const struct atmel_sam_pmc_config clock_cfg;
 	const struct pinctrl_dev_config *pincfg;
 	struct gpio_dt_spec carrier_detect;
+#ifdef CONFIG_SAM_HSMCI_XDMAC
+	const struct device *dma_dev;
+	uint32_t dma_channel;
+	uint32_t dma_perid;
+#endif
 };
 
 struct sam_hsmci_data {
 	bool open_drain;
 	uint8_t cmd_in_progress;
 	struct k_mutex mtx;
-	/* S-01b BM: when true, bypass PDC and use CPU-polled transfer */
+	/* S-01b BM: when true, bypass DMA and use CPU-polled transfer */
 	bool force_manual;
+#ifdef CONFIG_SAM_HSMCI_XDMAC
+	struct k_sem xfer_done;
+	int xfer_status;
+#endif
 };
 
 void sam_hsmci_set_force_manual(bool enable)
@@ -229,6 +242,18 @@ static int sam_hsmci_init(const struct device *dev)
 	}
 	/* Enable module's clock */
 	(void)clock_control_on(SAM_DT_PMC_CONTROLLER, (clock_control_subsys_t)&config->clock_cfg);
+
+#ifdef CONFIG_SAM_HSMCI_XDMAC
+	{
+		struct sam_hsmci_data *d = dev->data;
+
+		k_sem_init(&d->xfer_done, 0, 1);
+		if (!device_is_ready(config->dma_dev)) {
+			LOG_ERR("XDMAC device not ready");
+			return -ENODEV;
+		}
+	}
+#endif
 
 	/* init carrier detect (if set) */
 	if (config->carrier_detect.port != NULL) {
@@ -464,6 +489,18 @@ static inline int wait_read_transfer_done(Hsmci *hsmci)
 	return 0;
 }
 
+#ifdef CONFIG_SAM_HSMCI_XDMAC
+static void hsmci_dma_done(const struct device *dma_dev, void *user_data,
+			   uint32_t channel, int status)
+{
+	const struct device *dev = user_data;
+	struct sam_hsmci_data *d = dev->data;
+
+	d->xfer_status = status;
+	k_sem_give(&d->xfer_done);
+}
+#endif /* CONFIG_SAM_HSMCI_XDMAC */
+
 #ifndef _HSMCI_PDCMODE
 
 static int hsmci_do_manual_transfer(Hsmci *hsmci, bool byte_mode, bool is_write, void *data,
@@ -539,6 +576,9 @@ static int sam_hsmci_request_inner(const struct device *dev, struct sdhc_command
 	uint32_t cmdr = 0;
 	int ret;
 	bool is_write, byte_mode;
+#ifdef CONFIG_SAM_HSMCI_XDMAC
+	bool use_xdmac = false;
+#endif
 
 	LOG_DBG("%s(opcode=%d, arg=%08x, data=%08x, rsptype=%d)", __func__, cmd->opcode, cmd->arg,
 		(uint32_t)sd_data, cmd->response_type & SDHC_NATIVE_RESPONSE_MASK);
@@ -610,6 +650,59 @@ static int sam_hsmci_request_inner(const struct device *dev, struct sdhc_command
 
 		transfer_count = size * sd_data->blocks;
 
+#if defined(CONFIG_SAM_HSMCI_XDMAC) && !defined(_HSMCI_PDCMODE)
+		/* Configure and start XDMAC before sending the command.
+		 * HSMCI_DMA.DMAEN must also be set before CMDR is written —
+		 * see SAMS70 datasheet errata (handshake starts at command issue). */
+		if (!byte_mode && !data->force_manual) {
+			uint32_t byte_count = transfer_count * 4U;
+			uint32_t fifo_addr = (uint32_t)&hsmci->HSMCI_FIFO[0];
+			struct dma_block_config blk = {
+				.source_address  = is_write ? (uint32_t)sd_data->data : fifo_addr,
+				.dest_address    = is_write ? fifo_addr : (uint32_t)sd_data->data,
+				.block_size      = byte_count,
+				.source_addr_adj = is_write ? DMA_ADDR_ADJ_INCREMENT
+							    : DMA_ADDR_ADJ_NO_CHANGE,
+				.dest_addr_adj   = is_write ? DMA_ADDR_ADJ_NO_CHANGE
+							    : DMA_ADDR_ADJ_INCREMENT,
+			};
+			struct dma_config dma_cfg = {
+				.dma_slot            = config->dma_perid,
+				.channel_direction   = is_write ? MEMORY_TO_PERIPHERAL
+							         : PERIPHERAL_TO_MEMORY,
+				.source_data_size    = 4U,
+				.dest_data_size      = 4U,
+				/* burst=4 → find_msb_set(4)-1=2 → XDMAC CSIZE=2 = CHK_4
+				 * matches HSMCI_DMA_CHKSIZE_4 (val=2, 4 data/request) */
+				.source_burst_length = 4U,
+				.dest_burst_length   = 4U,
+				.block_count         = 1U,
+				.head_block          = &blk,
+				.dma_callback        = hsmci_dma_done,
+				.user_data           = (void *)dev,
+				.complete_callback_en = 1,
+			};
+
+			if (is_write) {
+				sys_cache_data_flush_range(sd_data->data, byte_count);
+			}
+
+			k_sem_reset(&data->xfer_done);
+
+			ret = dma_config(config->dma_dev, config->dma_channel, &dma_cfg);
+			if (ret == 0) {
+				ret = dma_start(config->dma_dev, config->dma_channel);
+			}
+			if (ret == 0) {
+				hsmci->HSMCI_DMA = HSMCI_DMA_DMAEN | HSMCI_DMA_CHKSIZE_4;
+				use_xdmac = true;
+			} else {
+				LOG_ERR("DMA setup failed (%d), falling back to manual", ret);
+				ret = 0;
+			}
+		}
+#endif /* CONFIG_SAM_HSMCI_XDMAC && !_HSMCI_PDCMODE */
+
 #ifdef _HSMCI_PDCMODE
 		/* S-01b BM: skip PDC when force_manual is set */
 		if (!data->force_manual) {
@@ -657,10 +750,46 @@ static int sam_hsmci_request_inner(const struct device *dev, struct sdhc_command
 			}
 		}
 #else  /* !_HSMCI_PDCMODE */
+#ifdef CONFIG_SAM_HSMCI_XDMAC
+		if (use_xdmac) {
+			if (ret == 0) {
+				int wait_ret = k_sem_take(&data->xfer_done,
+							  K_MSEC(cmd->timeout_ms));
+
+				if (wait_ret != 0) {
+					dma_stop(config->dma_dev, config->dma_channel);
+					hsmci->HSMCI_DMA = 0;
+					ret = -ETIMEDOUT;
+				} else if (data->xfer_status != 0) {
+					hsmci->HSMCI_DMA = 0;
+					ret = -EIO;
+				} else {
+					if (!is_write) {
+						sys_cache_data_invd_range(
+							sd_data->data,
+							transfer_count * 4U);
+						ret = sam_hsmci_wait_read_end(hsmci);
+					} else {
+						ret = sam_hsmci_wait_write_end(hsmci);
+					}
+					hsmci->HSMCI_DMA = 0;
+				}
+			} else {
+				dma_stop(config->dma_dev, config->dma_channel);
+				hsmci->HSMCI_DMA = 0;
+			}
+		} else {
+			if (ret == 0) {
+				ret = hsmci_do_manual_transfer(hsmci, byte_mode, is_write,
+							       sd_data->data, transfer_count);
+			}
+		}
+#else  /* !CONFIG_SAM_HSMCI_XDMAC */
 		if (ret == 0) {
 			ret = hsmci_do_manual_transfer(hsmci, byte_mode, is_write, sd_data->data,
 						       transfer_count);
 		}
+#endif /* CONFIG_SAM_HSMCI_XDMAC */
 #endif /* _HSMCI_PDCMODE */
 	}
 
@@ -674,12 +803,17 @@ static int sam_hsmci_request_inner(const struct device *dev, struct sdhc_command
 
 static void sam_hsmci_abort(const struct device *dev)
 {
-#ifdef _HSMCI_PDCMODE
 	const struct sam_hsmci_config *config = dev->config;
 	Hsmci *hsmci = config->base;
 
+#ifdef _HSMCI_PDCMODE
 	hsmci->HSMCI_PTCR = HSMCI_PTCR_RXTDIS | HSMCI_PTCR_TXTDIS;
 #endif /* _HSMCI_PDCMODE */
+
+#ifdef CONFIG_SAM_HSMCI_XDMAC
+	dma_stop(config->dma_dev, config->dma_channel);
+	hsmci->HSMCI_DMA = 0;
+#endif
 
 	struct sdhc_command cmd = {
 		.opcode = SD_STOP_TRANSMISSION, .arg = 0, .response_type = SD_RSP_TYPE_NONE};
@@ -766,13 +900,24 @@ static DEVICE_API(sdhc, hsmci_api) = {
 	.card_busy = sam_hsmci_card_busy,
 };
 
+#ifdef CONFIG_SAM_HSMCI_XDMAC
+#define SAM_HSMCI_DMA_CFG(N)                                                                       \
+	.dma_dev     = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(N, rxtx)),                         \
+	.dma_channel = DT_INST_DMAS_CELL_BY_NAME(N, rxtx, channel),                               \
+	.dma_perid   = DT_INST_DMAS_CELL_BY_NAME(N, rxtx, perid),
+#else
+#define SAM_HSMCI_DMA_CFG(N)
+#endif
+
 #define SAM_HSMCI_INIT(N)                                                                          \
 	PINCTRL_DT_INST_DEFINE(N);                                                                 \
 	static const struct sam_hsmci_config hsmci_##N##_config = {                                \
 		.base = (Hsmci *)DT_INST_REG_ADDR(N),                                              \
 		.pincfg = PINCTRL_DT_INST_DEV_CONFIG_GET(N),                                       \
 		.clock_cfg = SAM_DT_INST_CLOCK_PMC_CFG(N),                                         \
-		.carrier_detect = GPIO_DT_SPEC_INST_GET_OR(N, cd_gpios, {0})};                     \
+		.carrier_detect = GPIO_DT_SPEC_INST_GET_OR(N, cd_gpios, {0}),                      \
+		SAM_HSMCI_DMA_CFG(N)                                                                \
+	};                                                                                         \
 	static struct sam_hsmci_data hsmci_##N##_data = {};                                        \
 	DEVICE_DT_INST_DEFINE(N, &sam_hsmci_init, NULL, &hsmci_##N##_data, &hsmci_##N##_config,    \
 			      POST_KERNEL, CONFIG_SDHC_INIT_PRIORITY, &hsmci_api);
