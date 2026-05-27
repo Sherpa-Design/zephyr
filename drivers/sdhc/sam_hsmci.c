@@ -321,6 +321,9 @@ static int sam_hsmci_send_cmd(Hsmci *hsmci, struct sdhc_command *cmd, uint32_t c
 {
 	uint32_t sr;
 
+	/* Discard residual status bits left by a previous failed transfer */
+	(void)hsmci->HSMCI_SR;
+
 	hsmci->HSMCI_ARGR = cmd->arg;
 
 	cmdr |= HSMCI_CMDR_CMDNB(cmd->opcode) | HSMCI_CMDR_MAXLAT_64;
@@ -398,9 +401,6 @@ static int sam_hsmci_wait_write_end(Hsmci *hsmci)
 		}
 	} while (!(sr & HSMCI_SR_NOTBUSY));
 
-	if (!(hsmci->HSMCI_SR & HSMCI_SR_FIFOEMPTY)) {
-		return -EIO;
-	}
 	return 0;
 }
 
@@ -654,7 +654,7 @@ static int sam_hsmci_request_inner(const struct device *dev, struct sdhc_command
 		/* Configure and start XDMAC before sending the command.
 		 * HSMCI_DMA.DMAEN must also be set before CMDR is written —
 		 * see SAMS70 datasheet errata (handshake starts at command issue). */
-		if (!byte_mode && !data->force_manual) {
+		if (!byte_mode && !data->force_manual && !is_write) {
 			uint32_t byte_count = transfer_count * 4U;
 			uint32_t fifo_addr = (uint32_t)&hsmci->HSMCI_FIFO[0];
 			struct dma_block_config blk = {
@@ -872,6 +872,9 @@ static int sam_hsmci_request(const struct device *dev, struct sdhc_command *cmd,
 			}
 			if (!card_idle) {
 				LOG_ERR("Card did not idle after CMD12");
+				/* HSMCI may still have DTIP set; reset to clear all
+				 * transfer state before the next attempt */
+				sam_hsmci_reset(dev);
 				ret = -ETIMEDOUT;
 			} else if (ret == -ETIMEDOUT) {
 				/* DTOE fired during post-transfer busy wait; all data was
