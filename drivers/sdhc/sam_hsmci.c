@@ -655,7 +655,7 @@ static int sam_hsmci_request_inner(const struct device *dev, struct sdhc_command
 		/* Configure and start XDMAC before sending the command.
 		 * HSMCI_DMA.DMAEN must also be set before CMDR is written —
 		 * see SAMS70 datasheet errata (handshake starts at command issue). */
-		if (!byte_mode && !data->force_manual && !is_write) {
+		if (!byte_mode && !data->force_manual) {
 			uint32_t byte_count = transfer_count * 4U;
 			uint32_t fifo_addr = (uint32_t)&hsmci->HSMCI_FIFO[0];
 			struct dma_block_config blk = {
@@ -770,10 +770,40 @@ static int sam_hsmci_request_inner(const struct device *dev, struct sdhc_command
 							sd_data->data,
 							transfer_count * 4U);
 						ret = sam_hsmci_wait_read_end(hsmci);
+						hsmci->HSMCI_DMA = 0;
 					} else {
-						ret = sam_hsmci_wait_write_end(hsmci);
+						/* Clear DMA mode before polling NOTBUSY —
+						 * HSMCI will not send CMD12/stop while
+						 * DMAEN is set, so DAT0 never deasserts. */
+						hsmci->HSMCI_DMA = 0;
+						/* Yield-based poll: MSC runs at cooperative
+						 * priority; a tight spin starves UDC thread. */
+						{
+							uint32_t t0 = k_uptime_get_32();
+							uint32_t sr_w;
+
+							do {
+								sr_w = hsmci->HSMCI_SR;
+								if (sr_w & (HSMCI_SR_UNRE |
+									    HSMCI_SR_OVRE |
+									    HSMCI_SR_DTOE |
+									    HSMCI_SR_DCRCE)) {
+									ret = (sr_w & HSMCI_SR_DTOE)
+										? -ETIMEDOUT
+										: -EIO;
+									break;
+								}
+								if ((uint32_t)(k_uptime_get_32() - t0) >=
+								    (uint32_t)cmd->timeout_ms) {
+									LOG_WRN("write NOTBUSY timeout SR=0x%08x",
+										sr_w);
+									ret = -ETIMEDOUT;
+									break;
+								}
+								k_yield();
+							} while (!(sr_w & HSMCI_SR_NOTBUSY));
+						}
 					}
-					hsmci->HSMCI_DMA = 0;
 				}
 			} else {
 				dma_stop(config->dma_dev, config->dma_channel);
