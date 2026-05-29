@@ -143,9 +143,9 @@ static int sam_hsmci_get_host_props(const struct device *dev, struct sdhc_host_p
 
 	props->f_max = _HSMCI_MAX_FREQ;
 	props->f_min = _HSMCI_MIN_FREQ;
-	/* high-speed not working yet due to limitations of the SDHC sm */
 	props->host_caps.high_spd_support = false;
 	props->host_caps.vol_330_support = true;
+	props->bus_4_bit_support = true;
 	props->power_delay = 500;
 	props->is_spi = false;
 	props->max_current_330 = 4;
@@ -162,8 +162,8 @@ static int sam_hsmci_set_io(const struct device *dev, struct sdhc_io *ios)
 	uint32_t div_val;
 	int ret;
 
-	LOG_DBG("%s(clock=%d, bus_width=%d, timing=%d, mode=%d)", __func__, ios->clock,
-		ios->bus_width, ios->timing, ios->bus_mode);
+	LOG_WRN("HSMCI set_io: clock=%d bus_width=%d timing=%d", ios->clock,
+		ios->bus_width, ios->timing);
 
 	if (ios->clock > 0) {
 		if (ios->clock > _HSMCI_MAX_FREQ) {
@@ -189,7 +189,8 @@ static int sam_hsmci_set_io(const struct device *dev, struct sdhc_io *ios)
 			div_val = _MSMCI_MAX_DIVISOR;
 		}
 
-		LOG_DBG("divider: %d (freq=%d)", div_val, frequency / (div_val + 2));
+		LOG_WRN("HSMCI clk: MCK=%d div=%d actual=%d Hz", frequency, div_val,
+			frequency / (div_val + 2));
 
 		hsmci->HSMCI_MR &= ~HSMCI_MR_CLKDIV_Msk;
 		hsmci->HSMCI_MR |=
