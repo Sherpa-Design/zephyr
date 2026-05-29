@@ -251,6 +251,13 @@ struct udc_sam_usbhs_data {
 	atomic_t xfer_finished;
 	atomic_t out_pending;
 	atomic_t setup_pending;
+	/* Bit n set: USBHS_DEVDMA[n] is running for ep_idx n+1 (ep_idx 1-7).
+	 * Set before writing DEVDMACONTROL.CHANN_ENB; cleared in DMA ISR. */
+	atomic_t dma_active;
+	/* Bit n set: DMA finished loading FIFO; waiting for last bank(s) to
+	 * drain to the host.  TXINI ISR checks NBUSYBK to detect the last
+	 * ACK and then sets xfer_finished. */
+	atomic_t dma_draining;
 	uint8_t ctrl_out_buf[64] __aligned(4);
 	uint8_t setup[8];
 };
@@ -448,12 +455,72 @@ static int sam_usbhs_prep_in(const struct device *dev,
 			     struct udc_ep_config *const ep_cfg)
 {
 	const struct udc_sam_usbhs_config *config = dev->config;
+	struct udc_sam_usbhs_data *const priv = udc_get_private(dev);
 	Usbhs *const base = config->base;
 	uint8_t ep_idx = ep_addr_to_hw_ep(ep_cfg->addr);
-	volatile uint8_t *fifo = sam_usbhs_ep_fifo(ep_idx);
-	uint32_t len;
 
-	len = MIN(buf->len, udc_mps_ep_size(ep_cfg));
+	if (ep_idx >= 1 && buf->len > 0) {
+		/*
+		 * Endpoint DMA path for bulk/interrupt/iso IN endpoints.
+		 *
+		 * The SAM E70 USBHS DMA cannot pause-and-resume across bank
+		 * boundaries: once both dual banks fill, the DMA stalls
+		 * permanently without generating END_BF_ST.  To avoid this,
+		 * limit each DMA to one MPS chunk (one bank).  The drain
+		 * handler restarts DMA for each subsequent chunk until the
+		 * buffer is exhausted.
+		 *
+		 * Ordering: set dma_active and enable DMA interrupt BEFORE
+		 * writing CHANN_ENB (which starts the DMA) to avoid missing
+		 * the completion interrupt or triggering the TXINI guard too
+		 * late.
+		 */
+		uint32_t mps = udc_mps_ep_size(ep_cfg);
+		uint32_t chunk = MIN((uint32_t)buf->len, mps);
+
+		/* Flush CPU cache to SRAM so USB DMA reads the most recent
+		 * CPU-written data (e.g. INQUIRY, MODE SENSE responses built in
+		 * net_buf by the MSC class).  For HSMCI DMA-filled READ buffers
+		 * the cache lines are already clean (HSMCI bypasses the CPU cache
+		 * and writes directly to SRAM), so this is a no-op in that path
+		 * and harmless. */
+		sys_cache_data_flush_range(buf->data, chunk);
+		base->USBHS_DEVDMA[ep_idx - 1].USBHS_DEVDMAADDRESS =
+			(uint32_t)buf->data;
+
+		/* Atomically: disable TXINE, clear stale TXINI flag, clear stale
+		 * dma_draining, set dma_active.  irq_lock prevents a pending TXINI
+		 * ISR (with dma_draining=1, NBUSYBK=0 from a previous drain cycle)
+		 * from racing into the drain path and setting xfer_finished before
+		 * this DMA has even started. */
+		unsigned int key = irq_lock();
+		base->USBHS_DEVEPTIDR[ep_idx] = USBHS_DEVEPTIDR_TXINEC;
+		base->USBHS_DEVEPTICR[ep_idx] = USBHS_DEVEPTICR_TXINIC;
+		atomic_clear_bit(&priv->dma_draining, ep_idx - 1);
+		atomic_set_bit(&priv->dma_active, ep_idx - 1);
+		irq_unlock(key);
+
+		/* Enable DMA interrupt and start DMA after irq_unlock so the ISR
+		 * sees dma_active=1 and dma_draining=0 from the outset.
+		 * END_B_EN omitted: would stop DMA after first bank on AUTOSW
+		 * endpoints.  END_BUFFIT fires once when all chunk bytes loaded. */
+		base->USBHS_DEVIER = BIT(USBHS_DEVISR_DMA_1_Pos + ep_idx - 1);
+		base->USBHS_DEVDMA[ep_idx - 1].USBHS_DEVDMACONTROL =
+			USBHS_DEVDMACONTROL_CHANN_ENB  |
+			USBHS_DEVDMACONTROL_END_BUFFIT |
+			USBHS_DEVDMACONTROL_BUFF_LENGTH(chunk);
+		uint32_t dtseq_val = (base->USBHS_DEVEPTISR[ep_idx] &
+				      USBHS_DEVEPTISR_DTSEQ_Msk) >>
+				     USBHS_DEVEPTISR_DTSEQ_Pos;
+		LOG_WRN("DMA START ep 0x%02x len %u chunk %u dma_ch=%u dtseq=%u",
+			ep_cfg->addr, buf->len, chunk, ep_idx - 1, dtseq_val);
+		return 0;
+	}
+
+	/* EP0 (and ZLP) path: byte-copy into FIFO, TXINI-driven. */
+	volatile uint8_t *fifo = sam_usbhs_ep_fifo(ep_idx);
+	uint32_t len = MIN(buf->len, udc_mps_ep_size(ep_cfg));
+
 	LOG_DBG("Prepare IN ep 0x%02x length %u (total %u)", ep_cfg->addr, len, buf->len);
 
 	for (uint32_t i = 0; i < len; i++) {
@@ -461,18 +528,8 @@ static int sam_usbhs_prep_in(const struct device *dev,
 	}
 	barrier_dsync_fence_full();
 
-	/*
-	 * Clear the TXINI interrupt flag and enable the interrupt.
-	 * The interrupt was disabled by the ISR when the previous transfer
-	 * completed, so we must re-enable it for every new transfer.
-	 */
 	base->USBHS_DEVEPTICR[ep_idx] = USBHS_DEVEPTICR_TXINIC;
 	base->USBHS_DEVEPTIER[ep_idx] = USBHS_DEVEPTIER_TXINES;
-
-	if (ep_idx != 0) {
-		/* Clear FIFOCON to trigger the IN transaction */
-		base->USBHS_DEVEPTIDR[ep_idx] = USBHS_DEVEPTIDR_FIFOCONC;
-	}
 
 	return 0;
 }
@@ -541,6 +598,21 @@ static void sam_usbhs_handle_xfer_next(const struct device *dev,
 	if (USB_EP_DIR_IS_OUT(ep_cfg->addr)) {
 		err = sam_usbhs_prep_out(dev, buf, ep_cfg);
 	} else {
+		/* Pre-disable TXINE before logging XFER_NEXT.  With TXINE=0 any
+		 * USB ISR that fires in the window between here and prep_in's
+		 * irq_lock will mask TXINI in (DEVEPTISR & DEVEPTIMR) and will
+		 * not enter sam_usbhs_handle_in_isr(), preventing a stale
+		 * dma_draining from setting xfer_finished prematurely. */
+		uint8_t xn_ep_idx = ep_addr_to_hw_ep(ep_cfg->addr);
+
+		if (xn_ep_idx >= 1) {
+			const struct udc_sam_usbhs_config *xn_config = dev->config;
+
+			xn_config->base->USBHS_DEVEPTIDR[xn_ep_idx] =
+				USBHS_DEVEPTIDR_TXINEC;
+		}
+		LOG_WRN("XFER_NEXT THREAD ep 0x%02x buf=%p len=%u",
+			ep_cfg->addr, (void *)buf, buf->len);
 		err = sam_usbhs_prep_in(dev, buf, ep_cfg);
 	}
 
@@ -858,10 +930,67 @@ static void sam_usbhs_handle_in_isr(const struct device *dev,
 	struct net_buf *buf;
 	uint32_t len;
 
+	if (ep_idx >= 1 && atomic_test_bit(&priv->dma_active, ep_idx - 1)) {
+		/* DMA owns this endpoint's FIFO — spurious TXINI during DMA
+		 * setup window; disable TXINE and return. */
+		base->USBHS_DEVEPTIDR[ep_idx] = USBHS_DEVEPTIDR_TXINEC;
+		return;
+	}
+
 	buf = udc_buf_peek(ep_cfg);
 	if (buf == NULL) {
 		LOG_ERR("No buffer for ep 0x%02x", ep_addr);
 		base->USBHS_DEVEPTIDR[ep_idx] = USBHS_DEVEPTIDR_TXINEC;
+		return;
+	}
+
+	/* DMA drain: all bytes loaded into FIFO; wait for last bank ACK. */
+	if (ep_idx >= 1 && atomic_test_bit(&priv->dma_draining, ep_idx - 1)) {
+		uint32_t isr_val = base->USBHS_DEVEPTISR[ep_idx];
+		uint32_t nbusybk = (isr_val & USBHS_DEVEPTISR_NBUSYBK_Msk) >>
+				   USBHS_DEVEPTISR_NBUSYBK_Pos;
+
+		base->USBHS_DEVEPTICR[ep_idx] = USBHS_DEVEPTICR_TXINIC;
+
+		/* Re-read NBUSYBK after TXINIC to close the race where the last
+		 * bank was ACKed between our read above and the TXINIC write.
+		 * If the ACK set TXINI and we just cleared it, the re-read will
+		 * show NBUSYBK=0 so we don't miss the completion. */
+		if (nbusybk != 0) {
+			isr_val = base->USBHS_DEVEPTISR[ep_idx];
+			nbusybk = (isr_val & USBHS_DEVEPTISR_NBUSYBK_Msk) >>
+				  USBHS_DEVEPTISR_NBUSYBK_Pos;
+		}
+
+		if (nbusybk != 0) {
+			LOG_WRN("DRAIN ep_idx=%u NBUSYBK=%u (bank busy)", ep_idx, nbusybk);
+		}
+
+		if (nbusybk == 0) {
+			/* Last bank ACKed — chunk complete. */
+			atomic_clear_bit(&priv->dma_draining, ep_idx - 1);
+			if (udc_ep_buf_has_zlp(buf)) {
+				base->USBHS_DEVEPTIDR[ep_idx] = USBHS_DEVEPTIDR_FIFOCONC;
+				base->USBHS_DEVEPTIER[ep_idx] = USBHS_DEVEPTIER_TXINES;
+				udc_ep_buf_clear_zlp(buf);
+				return;
+			}
+			if (buf->len > 0) {
+				/* More data remains — start DMA for the next
+				 * MPS chunk from ISR context. */
+				LOG_WRN("DRAIN restart ISR ep_idx=%u buf=%p rem=%u",
+					ep_idx, (void *)buf, buf->len);
+				sam_usbhs_prep_in(dev, buf, ep_cfg);
+				return;
+			}
+			/* All bytes sent and last bank ACKed. */
+			LOG_WRN("DRAIN done ep_idx=%u buf=%p", ep_idx, (void *)buf);
+			base->USBHS_DEVEPTIDR[ep_idx] = USBHS_DEVEPTIDR_TXINEC;
+			atomic_set_bit(&priv->xfer_finished, ep_to_bit(ep_addr));
+		} else {
+			/* Banks still in flight — wait for next TXINI. */
+			base->USBHS_DEVEPTIER[ep_idx] = USBHS_DEVEPTIER_TXINES;
+		}
 		return;
 	}
 
@@ -888,6 +1017,16 @@ static void sam_usbhs_handle_in_isr(const struct device *dev,
 		}
 
 		base->USBHS_DEVEPTIDR[ep_idx] = USBHS_DEVEPTIDR_TXINEC;
+		/* ep_idx >= 1 should never reach this non-DMA path during DMA
+		 * transfers — xfer_finished here means dma_draining was 0 when
+		 * TXINI fired, which indicates a stale-TXINI or missed-drain bug. */
+		if (ep_idx >= 1) {
+			LOG_ERR("NON-DMA xfer_finished ep_idx=%u buf=%p len=%u "
+				"dma_act=%d dma_drn=%d",
+				ep_idx, (void *)buf, buf->len,
+				(int)atomic_test_bit(&priv->dma_active, ep_idx - 1),
+				(int)atomic_test_bit(&priv->dma_draining, ep_idx - 1));
+		}
 		atomic_set_bit(&priv->xfer_finished, ep_to_bit(ep_addr));
 	}
 }
@@ -915,6 +1054,82 @@ static void sam_usbhs_handle_ep_isr(const struct device *dev,
 	if (sr & USBHS_DEVEPTISR_TXINI) {
 		sam_usbhs_handle_in_isr(dev, ep_idx);
 	}
+}
+
+/*
+ * Handle USBHS endpoint DMA completion for IN endpoints (ep_idx 1-7).
+ *
+ * Called when DEVISR.DMA_n fires (bit 25+n-1).  Reading DEVDMASTATUS clears
+ * the END_BF_ST flag (hardware read-to-clear behaviour).
+ *
+ * After all bytes are loaded into the FIFO by DMA, re-enable TXINE so the
+ * existing sam_usbhs_handle_in_isr() path handles the last-bank-sent event
+ * and any ZLP the MSC layer may need.  This avoids duplicating ZLP logic here.
+ */
+static void sam_usbhs_handle_dma_in_isr(const struct device *dev,
+					 const uint8_t ep_idx)
+{
+	const struct udc_sam_usbhs_config *config = dev->config;
+	struct udc_sam_usbhs_data *const priv = udc_get_private(dev);
+	Usbhs *const base = config->base;
+	uint8_t ep_addr = hw_ep_to_ep_addr(ep_idx, true);
+	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, ep_addr);
+	struct net_buf *buf;
+
+	/* Read DEVDMASTATUS to clear END_BF_ST / END_TR_ST.
+	 * END_TR_ST fires at every AUTOSW bank switch (not just final completion).
+	 * When BUFF_COUNT > 0 the DMA is still running — skip the intermediate event. */
+	uint32_t dma_status = base->USBHS_DEVDMA[ep_idx - 1].USBHS_DEVDMASTATUS;
+
+	if (dma_status & USBHS_DEVDMASTATUS_BUFF_COUNT_Msk) {
+		/* Should not happen: END_B_EN removed so no per-bank interrupts.
+		 * If seen, a spurious event occurred — log and ignore. */
+		LOG_ERR("DMA spurious ISR ep_idx=%u status=0x%08x cnt=%u",
+			ep_idx, dma_status,
+			(dma_status & USBHS_DEVDMASTATUS_BUFF_COUNT_Msk) >>
+			USBHS_DEVDMASTATUS_BUFF_COUNT_Pos);
+		return;
+	}
+
+	LOG_WRN("DMA ISR ep_idx=%u status=0x%08x dtseq=%u", ep_idx, dma_status,
+		(base->USBHS_DEVEPTISR[ep_idx] & USBHS_DEVEPTISR_DTSEQ_Msk) >>
+		USBHS_DEVEPTISR_DTSEQ_Pos);
+
+	/* DMA completed (BUFF_COUNT == 0). Disable DMA interrupt and release ownership. */
+	base->USBHS_DEVIDR = BIT(USBHS_DEVISR_DMA_1_Pos + ep_idx - 1);
+	atomic_clear_bit(&priv->dma_active, ep_idx - 1);
+
+	buf = udc_buf_peek(ep_cfg);
+	if (buf == NULL) {
+		LOG_ERR("DMA IN ep 0x%02x: no buffer at completion", ep_addr);
+		return;
+	}
+
+	/* Pull exactly the chunk that was DMA'd (one MPS or the remaining
+	 * tail if < MPS).  buf->len is the full remaining transfer length;
+	 * the DMA was started with MIN(buf->len, mps) so BUFF_COUNT=0 means
+	 * that many bytes were loaded into the FIFO. */
+	uint32_t mps = udc_mps_ep_size(ep_cfg);
+	uint32_t chunk = MIN((uint32_t)buf->len, mps);
+
+	net_buf_pull(buf, chunk);
+
+	/* AUTOSW fires only when DMA crosses a bank boundary (bank fills AND
+	 * DMA continues to the next bank).  For the last bank — whether partial
+	 * or exactly MPS — DMA stops simultaneously with the bank fill, so
+	 * AUTOSW never fires and FIFOCON is never cleared by hardware.
+	 * Always release FIFOCON here so the last bank is transmitted. */
+	base->USBHS_DEVEPTIDR[ep_idx] = USBHS_DEVEPTIDR_FIFOCONC;
+	LOG_DBG("DMA FIFOCONC ep_idx=%u chunk=%u rem=%u", ep_idx, chunk, buf->len);
+
+	/* Enter drain mode: TXINI ISR will use NBUSYBK to detect when the
+	 * last bank has been ACKed by the host.
+	 *
+	 * Do NOT write TXINIC before TXINES — if the last bank was already
+	 * ACKed (TXINI set while TXINE was disabled), clearing TXINI then
+	 * enabling TXINE would cause a deadlock: no further TXINI fires. */
+	atomic_set_bit(&priv->dma_draining, ep_idx - 1);
+	base->USBHS_DEVEPTIER[ep_idx] = USBHS_DEVEPTIER_TXINES;
 }
 
 static void sam_usbhs_isr_handler(const struct device *dev)
@@ -992,6 +1207,32 @@ static void sam_usbhs_isr_handler(const struct device *dev)
 		}
 	}
 
+	/* Endpoint DMA completions — bits 25-31 of DEVISR (DMA_1..DMA_7).
+	 * Each bit corresponds to ep_idx = bit_position - DMA_1_Pos + 1. */
+	if (sr & USBHS_DEVISR_DMA__Msk) {
+		uint32_t dma_sr = (sr & USBHS_DEVISR_DMA__Msk) >>
+				  USBHS_DEVISR_DMA_1_Pos;
+
+		while (dma_sr) {
+			uint8_t bit = find_lsb_set(dma_sr) - 1; /* 0-based */
+			uint8_t ep_idx = bit + 1;
+
+			dma_sr &= ~BIT(bit);
+
+			if (ep_idx & 1) {
+				/* Odd ep_idx = IN endpoint */
+				sam_usbhs_handle_dma_in_isr(dev, ep_idx);
+			} else {
+				/* Even ep_idx = OUT endpoint — DMA not yet
+				 * implemented for OUT; disable interrupt. */
+				base->USBHS_DEVIDR =
+					BIT(USBHS_DEVISR_DMA_1_Pos + bit);
+				LOG_WRN("Unexpected DMA interrupt for OUT ep%u",
+					ep_idx);
+			}
+		}
+	}
+
 	/*
 	 * Batched thread wake-up: check all pending flags and wake thread
 	 * once if any events need processing. This reduces context switches.
@@ -1043,7 +1284,22 @@ static int udc_sam_usbhs_ep_dequeue(const struct device *dev,
 	int bit = ep_to_bit(ep_cfg->addr);
 	unsigned int lock_key;
 
+	LOG_WRN("EP_DEQUEUE ep 0x%02x dma_act=%d dma_drn=%d busy=%d",
+		ep_cfg->addr,
+		ep_idx >= 1 ? (int)atomic_test_bit(&priv->dma_active, ep_idx - 1) : -1,
+		ep_idx >= 1 ? (int)atomic_test_bit(&priv->dma_draining, ep_idx - 1) : -1,
+		(int)udc_ep_is_busy(ep_cfg));
+
 	lock_key = irq_lock();
+
+	/* Abort endpoint DMA if active for this endpoint */
+	if (ep_idx >= 1 && atomic_test_and_clear_bit(&priv->dma_active, ep_idx - 1)) {
+		base->USBHS_DEVDMA[ep_idx - 1].USBHS_DEVDMACONTROL = 0;
+		base->USBHS_DEVIDR = BIT(USBHS_DEVISR_DMA_1_Pos + ep_idx - 1);
+	}
+	if (ep_idx >= 1) {
+		atomic_clear_bit(&priv->dma_draining, ep_idx - 1);
+	}
 
 	if (USB_EP_DIR_IS_IN(ep_cfg->addr)) {
 		base->USBHS_DEVEPTIDR[ep_idx] = USBHS_DEVEPTIDR_TXINEC;
@@ -1117,7 +1373,7 @@ static int udc_sam_usbhs_ep_enable(const struct device *dev,
 	uint8_t log2ceil_mps;
 	uint8_t eptype;
 
-	LOG_DBG("Enable ep 0x%02x (hw_idx=%d, type=%d, mps=%d)",
+	LOG_WRN("EP_ENABLE ep 0x%02x (hw_idx=%d, type=%d, mps=%d)",
 		ep_cfg->addr, ep_idx, ep_type, ep_cfg->mps);
 
 	/*
@@ -1191,18 +1447,16 @@ static int udc_sam_usbhs_ep_enable(const struct device *dev,
 	}
 
 	/*
-	 * Configure endpoint banks:
-	 * - Control endpoints: single-bank (per datasheet recommendation)
-	 * - Bulk/Interrupt/ISO endpoints: dual-bank (ping-pong mode)
-	 *
-	 * AUTOSW (automatic bank switching) is enabled for non-control endpoints
-	 * and requires multi-bank configuration to function correctly.
+	 * Single-bank for all endpoints. In dual-bank AUTOSW mode, TXINI fires
+	 * when the "current fill bank" becomes free — after FIFOCONC switches
+	 * the fill pointer to bank 1 (already free), a spurious TXINI fires
+	 * with NBUSYBK=1. Re-arming TXINES here never produces a second TXINI
+	 * on host ACK because bank 1's free state hasn't changed (no new edge),
+	 * leaving the drain hung indefinitely. With 1-bank AUTOSW, TXINI fires
+	 * only when the single bank is ACKed (NBUSYBK→0) — the only event
+	 * the drain ISR needs.
 	 */
-	if ((ep_cfg->attributes & USB_EP_TRANSFER_TYPE_MASK) == USB_EP_TYPE_CONTROL) {
-		regval |= USBHS_DEVEPTCFG_EPBK(USBHS_EPBK_1_BANK);
-	} else {
-		regval |= USBHS_DEVEPTCFG_EPBK(USBHS_EPBK_2_BANK);
-	}
+	regval |= USBHS_DEVEPTCFG_EPBK(USBHS_EPBK_1_BANK);
 
 	if ((ep_cfg->attributes & USB_EP_TRANSFER_TYPE_MASK) != USB_EP_TYPE_CONTROL) {
 		regval |= USBHS_DEVEPTCFG_AUTOSW;
@@ -1228,8 +1482,10 @@ static int udc_sam_usbhs_ep_enable(const struct device *dev,
 	/* Hardware reset cleared any physical halt; sync the software flag. */
 	ep_cfg->stat.halted = false;
 
-	LOG_DBG("EP%d after enable: CFG=0x%08x ISR=0x%08x",
-		ep_idx, base->USBHS_DEVEPTCFG[ep_idx], base->USBHS_DEVEPTISR[ep_idx]);
+	LOG_WRN("EP%d after enable: CFG=0x%08x ISR=0x%08x dtseq=%u",
+		ep_idx, base->USBHS_DEVEPTCFG[ep_idx], base->USBHS_DEVEPTISR[ep_idx],
+		(base->USBHS_DEVEPTISR[ep_idx] & USBHS_DEVEPTISR_DTSEQ_Msk) >>
+		USBHS_DEVEPTISR_DTSEQ_Pos);
 
 	base->USBHS_DEVEPT |= BIT(USBHS_DEVEPT_EPEN0_Pos + ep_idx);
 	base->USBHS_DEVIER = BIT(USBHS_DEVIER_PEP_0_Pos + ep_idx);
@@ -1272,16 +1528,39 @@ static int udc_sam_usbhs_ep_set_halt(const struct device *dev,
 				     struct udc_ep_config *const ep_cfg)
 {
 	const struct udc_sam_usbhs_config *config = dev->config;
+	struct udc_sam_usbhs_data *const priv = udc_get_private(dev);
 	Usbhs *const base = config->base;
 	uint8_t ep_idx = ep_addr_to_hw_ep(ep_cfg->addr);
+	unsigned int lock_key;
 
-	LOG_DBG("Set halt ep 0x%02x", ep_cfg->addr);
+	LOG_WRN("EP_SET_HALT ep 0x%02x dma_act=%d dma_drn=%d busy=%d",
+		ep_cfg->addr,
+		ep_idx >= 1 ? (int)atomic_test_bit(&priv->dma_active, ep_idx - 1) : -1,
+		ep_idx >= 1 ? (int)atomic_test_bit(&priv->dma_draining, ep_idx - 1) : -1,
+		(int)udc_ep_is_busy(ep_cfg));
+
+	lock_key = irq_lock();
+
+	/* Abort DMA and drain before asserting STALL.  Without this, if
+	 * STALLRQ is set while dma_draining=1, the host can never ACK the
+	 * in-flight bank, NBUSYBK never reaches 0, and the TXINI ISR
+	 * re-enables TXINES on every fire → unbounded ISR loop. */
+	if (ep_idx >= 1 && atomic_test_and_clear_bit(&priv->dma_active, ep_idx - 1)) {
+		base->USBHS_DEVDMA[ep_idx - 1].USBHS_DEVDMACONTROL = 0;
+		base->USBHS_DEVIDR = BIT(USBHS_DEVISR_DMA_1_Pos + ep_idx - 1);
+	}
+	if (ep_idx >= 1) {
+		atomic_clear_bit(&priv->dma_draining, ep_idx - 1);
+		base->USBHS_DEVEPTIDR[ep_idx] = USBHS_DEVEPTIDR_TXINEC;
+	}
 
 	base->USBHS_DEVEPTIER[ep_idx] = USBHS_DEVEPTIER_CTRL_STALLRQS;
 
 	if (USB_EP_GET_IDX(ep_cfg->addr) != 0) {
 		ep_cfg->stat.halted = true;
 	}
+
+	irq_unlock(lock_key);
 
 	return 0;
 }
@@ -1294,7 +1573,9 @@ static int udc_sam_usbhs_ep_clear_halt(const struct device *dev,
 	struct udc_sam_usbhs_data *const priv = udc_get_private(dev);
 	uint8_t ep_idx = ep_addr_to_hw_ep(ep_cfg->addr);
 
-	LOG_DBG("Clear halt ep 0x%02x", ep_cfg->addr);
+	LOG_WRN("EP_CLEAR_HALT ep 0x%02x busy=%d buf=%p",
+		ep_cfg->addr, (int)udc_ep_is_busy(ep_cfg),
+		(void *)udc_buf_peek(ep_cfg));
 
 	if (ep_idx == 0) {
 		return 0;
@@ -1309,8 +1590,18 @@ static int udc_sam_usbhs_ep_clear_halt(const struct device *dev,
 
 	ep_cfg->stat.halted = false;
 
-	/* Resume queued transfers if any */
-	if (!udc_ep_is_busy(ep_cfg) && udc_buf_peek(ep_cfg)) {
+	/* Reset data toggle to DATA0 — USB spec section 9.4.5 requires this on
+	 * ClearFeature(ENDPOINT_HALT).  Without it the host expects DATA0 but
+	 * the endpoint sends DATA1, causing the host to silently discard the
+	 * first response (wrong toggle) → DRAIN never completes → timeout. */
+	base->USBHS_DEVEPTIER[ep_idx] = USBHS_DEVEPTIER_RSTDTS;
+
+	/* ep_set_halt aborted any in-progress DMA but left busy=true to guard
+	 * against spurious XFER_NEW.  Clear it here so the endpoint can restart.
+	 * Hardware is idle at this point (DMA off, TXINE disabled, STALLRQ clear). */
+	udc_ep_set_busy(ep_cfg, false);
+
+	if (udc_buf_peek(ep_cfg)) {
 		atomic_set_bit(&priv->xfer_new, ep_to_bit(ep_cfg->addr));
 		k_event_post(&priv->events, BIT(SAM_USBHS_EVT_XFER_NEW));
 	}
@@ -1571,6 +1862,8 @@ static int udc_sam_usbhs_driver_preinit(const struct device *dev)
 	atomic_clear(&priv->xfer_finished);
 	atomic_clear(&priv->out_pending);
 	atomic_clear(&priv->setup_pending);
+	atomic_clear(&priv->dma_active);
+	atomic_clear(&priv->dma_draining);
 
 	data->caps.rwup = true;
 	data->caps.mps0 = UDC_MPS0_64;
