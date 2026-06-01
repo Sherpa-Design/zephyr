@@ -512,7 +512,7 @@ static int sam_usbhs_prep_in(const struct device *dev,
 		uint32_t dtseq_val = (base->USBHS_DEVEPTISR[ep_idx] &
 				      USBHS_DEVEPTISR_DTSEQ_Msk) >>
 				     USBHS_DEVEPTISR_DTSEQ_Pos;
-		LOG_WRN("DMA START ep 0x%02x len %u chunk %u dma_ch=%u dtseq=%u",
+		LOG_DBG("DMA START ep 0x%02x len %u chunk %u dma_ch=%u dtseq=%u",
 			ep_cfg->addr, buf->len, chunk, ep_idx - 1, dtseq_val);
 		return 0;
 	}
@@ -611,7 +611,7 @@ static void sam_usbhs_handle_xfer_next(const struct device *dev,
 			xn_config->base->USBHS_DEVEPTIDR[xn_ep_idx] =
 				USBHS_DEVEPTIDR_TXINEC;
 		}
-		LOG_WRN("XFER_NEXT THREAD ep 0x%02x buf=%p len=%u",
+		LOG_DBG("XFER_NEXT ep 0x%02x buf=%p len=%u",
 			ep_cfg->addr, (void *)buf, buf->len);
 		err = sam_usbhs_prep_in(dev, buf, ep_cfg);
 	}
@@ -677,7 +677,11 @@ static ALWAYS_INLINE void sam_usbhs_thread_handler(const struct device *const de
 			if (!udc_ep_is_busy(ep_cfg)) {
 				sam_usbhs_handle_xfer_next(dev, ep_cfg);
 			} else {
-				LOG_ERR("Endpoint 0x%02x busy", ep);
+				/* XFER_FINISHED already started this transfer via
+				 * sam_usbhs_handle_xfer_next(); XFER_NEW is redundant.
+				 * This is expected when MSC pre-queues the next buffer
+				 * (e.g. CSW) before the current data chunk finishes. */
+				LOG_DBG("Endpoint 0x%02x busy (XFER_NEW redundant)", ep);
 			}
 		}
 	}
@@ -952,10 +956,8 @@ static void sam_usbhs_handle_in_isr(const struct device *dev,
 
 		base->USBHS_DEVEPTICR[ep_idx] = USBHS_DEVEPTICR_TXINIC;
 
-		/* Re-read NBUSYBK after TXINIC to close the race where the last
-		 * bank was ACKed between our read above and the TXINIC write.
-		 * If the ACK set TXINI and we just cleared it, the re-read will
-		 * show NBUSYBK=0 so we don't miss the completion. */
+		/* Re-read NBUSYBK after TXINIC to close the race where the bank
+		 * was ACKed between our read above and the TXINIC write. */
 		if (nbusybk != 0) {
 			isr_val = base->USBHS_DEVEPTISR[ep_idx];
 			nbusybk = (isr_val & USBHS_DEVEPTISR_NBUSYBK_Msk) >>
@@ -963,34 +965,27 @@ static void sam_usbhs_handle_in_isr(const struct device *dev,
 		}
 
 		if (nbusybk != 0) {
-			LOG_WRN("DRAIN ep_idx=%u NBUSYBK=%u (bank busy)", ep_idx, nbusybk);
+			/* Bank still being sent — re-arm and wait for next ACK. */
+			base->USBHS_DEVEPTIER[ep_idx] = USBHS_DEVEPTIER_TXINES;
+			return;
 		}
 
-		if (nbusybk == 0) {
-			/* Last bank ACKed — chunk complete. */
-			atomic_clear_bit(&priv->dma_draining, ep_idx - 1);
-			if (udc_ep_buf_has_zlp(buf)) {
-				base->USBHS_DEVEPTIDR[ep_idx] = USBHS_DEVEPTIDR_FIFOCONC;
-				base->USBHS_DEVEPTIER[ep_idx] = USBHS_DEVEPTIER_TXINES;
-				udc_ep_buf_clear_zlp(buf);
-				return;
-			}
-			if (buf->len > 0) {
-				/* More data remains — start DMA for the next
-				 * MPS chunk from ISR context. */
-				LOG_WRN("DRAIN restart ISR ep_idx=%u buf=%p rem=%u",
-					ep_idx, (void *)buf, buf->len);
-				sam_usbhs_prep_in(dev, buf, ep_cfg);
-				return;
-			}
-			/* All bytes sent and last bank ACKed. */
-			LOG_WRN("DRAIN done ep_idx=%u buf=%p", ep_idx, (void *)buf);
-			base->USBHS_DEVEPTIDR[ep_idx] = USBHS_DEVEPTIDR_TXINEC;
-			atomic_set_bit(&priv->xfer_finished, ep_to_bit(ep_addr));
-		} else {
-			/* Banks still in flight — wait for next TXINI. */
+		/* Bank ACKed. */
+		atomic_clear_bit(&priv->dma_draining, ep_idx - 1);
+		if (udc_ep_buf_has_zlp(buf)) {
+			base->USBHS_DEVEPTIDR[ep_idx] = USBHS_DEVEPTIDR_FIFOCONC;
 			base->USBHS_DEVEPTIER[ep_idx] = USBHS_DEVEPTIER_TXINES;
+			udc_ep_buf_clear_zlp(buf);
+			return;
 		}
+		if (buf->len > 0) {
+			LOG_DBG("DRAIN next ep_idx=%u rem=%u", ep_idx, buf->len);
+			sam_usbhs_prep_in(dev, buf, ep_cfg);
+			return;
+		}
+		/* All bytes sent and last bank ACKed — transfer complete. */
+		base->USBHS_DEVEPTIDR[ep_idx] = USBHS_DEVEPTIDR_TXINEC;
+		atomic_set_bit(&priv->xfer_finished, ep_to_bit(ep_addr));
 		return;
 	}
 
@@ -1091,7 +1086,7 @@ static void sam_usbhs_handle_dma_in_isr(const struct device *dev,
 		return;
 	}
 
-	LOG_WRN("DMA ISR ep_idx=%u status=0x%08x dtseq=%u", ep_idx, dma_status,
+	LOG_DBG("DMA ISR ep_idx=%u status=0x%08x dtseq=%u", ep_idx, dma_status,
 		(base->USBHS_DEVEPTISR[ep_idx] & USBHS_DEVEPTISR_DTSEQ_Msk) >>
 		USBHS_DEVEPTISR_DTSEQ_Pos);
 
@@ -1446,21 +1441,11 @@ static int udc_sam_usbhs_ep_enable(const struct device *dev,
 		regval |= USBHS_DEVEPTCFG_EPDIR_IN;
 	}
 
-	/*
-	 * Single-bank for all endpoints. In dual-bank AUTOSW mode, TXINI fires
-	 * when the "current fill bank" becomes free — after FIFOCONC switches
-	 * the fill pointer to bank 1 (already free), a spurious TXINI fires
-	 * with NBUSYBK=1. Re-arming TXINES here never produces a second TXINI
-	 * on host ACK because bank 1's free state hasn't changed (no new edge),
-	 * leaving the drain hung indefinitely. With 1-bank AUTOSW, TXINI fires
-	 * only when the single bank is ACKed (NBUSYBK→0) — the only event
-	 * the drain ISR needs.
-	 */
+	/* Single-bank for all endpoints. AUTOSW is intentionally NOT enabled:
+	 * in 1-bank mode the hardware wraps AUTOSW to the same bank, fires TXINI
+	 * immediately after FIFOCONC, and the pipeline path overwrites the bank
+	 * while USB is still sending it — causing corrupted packets and NAK storms. */
 	regval |= USBHS_DEVEPTCFG_EPBK(USBHS_EPBK_1_BANK);
-
-	if ((ep_cfg->attributes & USB_EP_TRANSFER_TYPE_MASK) != USB_EP_TYPE_CONTROL) {
-		regval |= USBHS_DEVEPTCFG_AUTOSW;
-	}
 
 	/*
 	 * ALLOC must be written in the same operation as the other configuration
