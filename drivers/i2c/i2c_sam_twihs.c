@@ -233,12 +233,18 @@ static int i2c_sam_twihs_transfer(const struct device *dev,
 #else
 		/* Wait for the transfer to complete */
 		if (k_sem_take(&dev_data->sem, K_MSEC(100)) != 0) {
-				/* Timeout — reset the bus */
-				LOG_ERR("I2C transfer timeout, recovering bus");
+				LOG_ERR("%s: I2C transfer timeout, recovering bus", dev->name);
+				/* Disable all TWIHS interrupts before reset */
+				twihs->TWIHS_IDR = 0xFFFFFFFF;
+				/* Software reset clears master mode and clock config */
 				twihs->TWIHS_CR = TWIHS_CR_SWRST;
+				/* Re-initialize: restore clock, slave-disable, master-enable */
+				i2c_clk_set(twihs, dev_cfg->bitrate);
+				twihs->TWIHS_CR = TWIHS_CR_SVDIS;
+				twihs->TWIHS_CR = TWIHS_CR_MSEN;
 				k_sem_give(&dev_data->lock);
 				return -ETIMEDOUT;
-		}	
+		}
 #endif
 		if (dev_data->msg.twihs_sr > 0) {
 			/* Something went wrong */
@@ -264,8 +270,12 @@ static void i2c_sam_twihs_isr(const struct device *dev)
 	/* Retrieve interrupt status */
 	isr_status = twihs->TWIHS_SR & twihs->TWIHS_IMR;
 
-	/* Not Acknowledged */
+	/* Not Acknowledged — SAM E70 datasheet: master must generate STOP after
+	 * NACK; the hardware does not do so automatically.  Without this STOP
+	 * the bus stays non-idle and the next write-only transfer (which relies
+	 * on THR-write auto-START) never generates a START → 100 ms timeout. */
 	if (isr_status & TWIHS_SR_NACK) {
+		twihs->TWIHS_CR = TWIHS_CR_STOP;
 		msg->twihs_sr = isr_status;
 		goto tx_comp;
 	}
@@ -356,9 +366,35 @@ static int i2c_sam_twihs_initialize(const struct device *dev)
 	return 0;
 }
 
+/* Called by i2c_recover_bus() after a sensor power cycle.  A plain
+ * i2c_configure() only writes CWGR+SVDIS+MSEN — it does NOT reset the
+ * peripheral.  When sensor VDD is cut, the pull-ups (tied to sensor VDD)
+ * drag SDA/SCL to 0 V, leaving TWIHS in a stuck bus state.  A SWRST is
+ * required to clear it before normal master-mode operation can resume. */
+static int i2c_sam_twihs_recover_bus(const struct device *dev)
+{
+	const struct i2c_sam_twihs_dev_cfg *const dev_cfg = dev->config;
+	struct i2c_sam_twihs_dev_data *const dev_data = dev->data;
+	Twihs *const twihs = dev_cfg->regs;
+	int ret;
+
+	k_sem_take(&dev_data->lock, K_FOREVER);
+
+	twihs->TWIHS_IDR = 0xFFFFFFFF;
+	twihs->TWIHS_CR  = TWIHS_CR_SWRST;
+
+	ret = i2c_clk_set(twihs, dev_cfg->bitrate);
+	twihs->TWIHS_CR = TWIHS_CR_SVDIS;
+	twihs->TWIHS_CR = TWIHS_CR_MSEN;
+
+	k_sem_give(&dev_data->lock);
+	return ret;
+}
+
 static DEVICE_API(i2c, i2c_sam_twihs_driver_api) = {
-	.configure = i2c_sam_twihs_configure,
-	.transfer = i2c_sam_twihs_transfer,
+	.configure   = i2c_sam_twihs_configure,
+	.transfer    = i2c_sam_twihs_transfer,
+	.recover_bus = i2c_sam_twihs_recover_bus,
 };
 
 #define I2C_TWIHS_SAM_INIT(n)						\

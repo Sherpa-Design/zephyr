@@ -33,6 +33,20 @@ LOG_MODULE_REGISTER(soc);
  */
 static ALWAYS_INLINE void clock_init(void)
 {
+	/*
+	 * MCUboot runs this same clock_init() from POR state (4 MHz RC → 150 MHz
+	 * PLLA). When the app starts after MCUboot, clocks are already at 150 MHz
+	 * PLLA and the I-cache is about to be enabled (done before this call in
+	 * soc_reset_hook). Re-running the sequence would drop MCK from 150 MHz
+	 * back to 12 MHz RC with the I-cache live — the downward PMC_MCKR
+	 * transition glitches the instruction fetch and corrupts the PC.
+	 * Detect "already at PLLA" and return immediately; MCUboot has already
+	 * set EFC wait states, SUPC crystal, and PLLA to the same target values.
+	 */
+	if ((PMC->PMC_MCKR & PMC_MCKR_CSS_Msk) == PMC_MCKR_CSS_PLLA_CLK) {
+		return;
+	}
+
 	/* Switch the main clock to the internal OSC with 12MHz */
 	soc_pmc_switch_mainck_to_fastrc(SOC_PMC_FAST_RC_FREQ_12MHZ);
 
@@ -127,16 +141,45 @@ void soc_reset_hook(void)
 	__ISB();
 
 	/*
-	 * D-cache is enabled by default at reset; disable and re-enable it
-	 * cleanly so sys_cache_*_enable() starts from a known state.
+	 * D-cache may be enabled from a prior stage (e.g. MCUboot).  Use
+	 * SCB_DisableDCache() only — it performs DCCISW (clean+invalidate,
+	 * i.e. write-back then discard) on every set/way before clearing
+	 * CCR.DC.  SCB_InvalidateDCache() (DCISW, discard without writeback)
+	 * must NOT be called first: the push {r4,r5,r6,lr} at function entry
+	 * wrote the return address into the D-cache (write-back policy);
+	 * calling DCISW before DCCISW discards that dirty line without
+	 * writing LR to SRAM, so the subsequent pop {pc} fetches stale
+	 * MCUboot data from SRAM and jumps to a garbage address.
 	 */
-	SCB_InvalidateDCache();
 	SCB_DisableDCache();
 
 	/*
-	 * Enable the caches only if configured to do so.
+	 * I-cache invalidation sequence for Cortex-M7 (SAM S70):
+	 *
+	 * 1. Pre-enable ICIALLU handles the case where a prior stage (bootloader)
+	 *    left IC=1: SCB_EnableICache() returns early if IC is set, skipping
+	 *    its internal ICIALLU.  Writing ICIALLU here while IC=1 is DEFINED
+	 *    per ARM DDI0489 §4.2.3 and clears any stale lines the prior stage
+	 *    left behind.
+	 *
+	 * 2. Post-enable ICIALLU handles the cold-boot (IC=0) case: ICIALLU is
+	 *    UNPREDICTABLE on Cortex-M7 when IC=0 (DDI0489 §4.2.3) — on this
+	 *    implementation it is a NOP.  SYSRESETREQ clears CCR.IC but does NOT
+	 *    clear the cache tag SRAM, so valid bits from a prior erase/reprogram
+	 *    cycle survive the reset.  After sys_cache_instr_enable() sets IC=1
+	 *    we issue ICIALLU again with IC=1 (guaranteed defined) to clear those
+	 *    stale lines before any instruction fetch can use them.
 	 */
-	sys_cache_instr_enable();
+	SCB->ICIALLU = 0UL;   /* pre-enable: clears stale lines if IC was already 1 */
+	__DSB();
+	__ISB();
+
+	sys_cache_instr_enable();   /* sets IC=1 (ICIALLU inside is with IC=0: NOP) */
+
+	SCB->ICIALLU = 0UL;   /* post-enable: ICIALLU with IC=1 — defined, guaranteed */
+	__DSB();
+	__ISB();
+
 	sys_cache_data_enable();
 
 	/* Setup system clocks */

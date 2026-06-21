@@ -859,3 +859,8 @@ static const struct bmi270_feature_config bmi270_feature_base = {
 			      &bmi270_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(BMI270_CREATE_INST);
+
+int bmi270_reinit(const struct device *dev)
+{
+    return bmi270_init(dev);
+}
