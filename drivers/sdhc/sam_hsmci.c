@@ -179,22 +179,24 @@ static int sam_hsmci_set_io(const struct device *dev, struct sdhc_io *ios)
 			return ret;
 		}
 
-		div_val = frequency / ios->clock - 2;
+		/* SAME70 DS §46.8.7: MCI_CLK = MCK / (2*(CLKDIV+1)), CLKODD=0.
+		 * Ceiling so MCI_CLK ≤ ios->clock: CLKDIV = ceil(MCK/(2*target)) − 1.
+		 * Old floor formula (MCK/target − 2) gave CLKDIV=0 at 150 MHz/52 MHz
+		 * → 75 MHz actual, 44% over the HS-SDR 52 MHz ceiling. */
+		div_val = (frequency + 2u * (uint32_t)ios->clock - 1u) /
+			  (2u * (uint32_t)ios->clock);
+		div_val = (div_val > 0u) ? div_val - 1u : 0u;
 
-		if (div_val < 0) {
-			div_val = 0;
+		if (div_val > 255u) {
+			div_val = 255u;
 		}
 
-		if (div_val > _MSMCI_MAX_DIVISOR) {
-			div_val = _MSMCI_MAX_DIVISOR;
-		}
+		LOG_WRN("HSMCI clk: MCK=%u CLKDIV=%u actual=%u Hz",
+			frequency, div_val,
+			frequency / (2u * (div_val + 1u)));
 
-		LOG_WRN("HSMCI clk: MCK=%d div=%d actual=%d Hz", frequency, div_val,
-			frequency / (div_val + 2));
-
-		hsmci->HSMCI_MR &= ~HSMCI_MR_CLKDIV_Msk;
-		hsmci->HSMCI_MR |=
-			((div_val & 1) ? HSMCI_MR_CLKODD : 0) | HSMCI_MR_CLKDIV(div_val >> 1);
+		hsmci->HSMCI_MR &= ~(HSMCI_MR_CLKDIV_Msk | HSMCI_MR_CLKODD);
+		hsmci->HSMCI_MR |= HSMCI_MR_CLKDIV(div_val);
 	}
 
 	if (ios->bus_width)	{
