@@ -77,12 +77,11 @@ static ALWAYS_INLINE void clock_init(void)
 	}
 
 	/*
-	 * Set FWS (Flash Wait State) value before increasing Master Clock
-	 * (MCK) frequency.
-	 * TODO: set FWS based on the actual MCK frequency and VDDIO value
-	 * rather than maximum supported 150 MHz at standard VDDIO=2.7V
+	 * Set FWS = 6 before switching MCK to 150 MHz (PLLA).
+	 * CHIP_FREQ_FWS_6 = 150,000,000 in same70n20.h; CHIP_FREQ_FWS_5 only
+	 * covers <= 138 MHz — FWS=5 is one wait state short at 150 MHz.
 	 */
-	EFC->EEFC_FMR = EEFC_FMR_FWS(5) | EEFC_FMR_CLOE;
+	EFC->EEFC_FMR = EEFC_FMR_FWS(6) | EEFC_FMR_CLOE;
 
 	/*
 	 * Setup PLLA
@@ -217,6 +216,18 @@ void soc_early_init_hook(void)
 	 * the Zephyr WDT driver PRE_KERNEL_1 init runs.
 	 */
 	WDT->WDT_MR = WDT_MR_WDDIS | WDT_MR_WDV(0xFFF) | WDT_MR_WDD(0xFFF);
+
+	/* Drive PD19 (UART4 TX) HIGH before the UART driver claims the pin.
+	 * After SYSRESETREQ, PD19 floats as GPIO-input; TeraTerm's UART
+	 * receiver sees noise and loses framing.  A few ms of TX=HIGH gives
+	 * the USB-UART dongle time to clear and resync.
+	 * At 150 MHz MCK (inherited from bootloader) ~200 000 loop iterations
+	 * ≈ 4 ms, well over 20 character periods at 57600 baud (174 µs each). */
+	PMC->PMC_PCER0 = (1U << 16);   /* PIOD peripheral clock on (PID 16) */
+	PIOD->PIO_PER  = (1U << 19);   /* PIO takes control of PD19        */
+	PIOD->PIO_OER  = (1U << 19);   /* PD19 = output                    */
+	PIOD->PIO_SODR = (1U << 19);   /* PD19 = HIGH (UART idle = 1)      */
+	for (volatile uint32_t i = 0; i < 200000U; i++) { }  /* ~4 ms      */
 
 	/* S-06: Cortex-M7 AHBS arbitration — favour DMA over CPU for TCM.
 	 * CM7_AHBSCR @ 0xE000EFA0:
