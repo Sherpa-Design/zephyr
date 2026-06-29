@@ -23,6 +23,7 @@
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/clock_control/atmel_sam_pmc.h>
+#include <zephyr/drivers/clock_control.h>
 
 #define LOG_LEVEL CONFIG_I2C_LOG_LEVEL
 #include <zephyr/logging/log.h>
@@ -68,20 +69,29 @@ struct i2c_sam_twihs_dev_data {
 	struct k_sem lock;
 	struct k_sem sem;
 	struct twihs_msg msg;
+	uint32_t current_bitrate;
 };
 
-static int i2c_clk_set(Twihs *const twihs, uint32_t speed)
+static int i2c_clk_set(Twihs *const twihs, uint32_t mck_hz, uint32_t speed)
 {
 	uint32_t ck_div = 0U;
 	uint32_t cl_div;
 	bool div_completed = false;
 
 	/*  From the datasheet "TWIHS Clock Waveform Generator Register"
-	 *  T_low = ( ( CLDIV × 2^CKDIV ) + 3 ) × T_MCK
+	 *  T_low = ( ( CLDIV x 2^CKDIV ) + 3 ) x T_MCK
+	 *  Uses live mck_hz from clock_control_get_rate() instead of the
+	 *  compile-time SOC_ATMEL_SAM_MCK_FREQ_HZ constant so CWGR is correct
+	 *  after a runtime MCK switch.  Ceiling divisions ensure f_SCL <= speed.
 	 */
+	/* ceil(mck_hz / (speed * 2)): half-period count at CKDIV=0 */
+	uint32_t period = (mck_hz + (speed * 2U) - 1U) / (speed * 2U);
+	uint32_t num    = (period > 3U) ? (period - 3U) : 0U;
+
 	while (!div_completed) {
-		cl_div =   ((SOC_ATMEL_SAM_MCK_FREQ_HZ / (speed * 2U)) - 3)
-			 / (1 << ck_div);
+		uint32_t divisor = 1U << ck_div;
+		/* Ceiling: ensures cl_div never undershoots (which would overclock) */
+		cl_div = (num + divisor - 1U) / divisor;
 
 		if (cl_div <= 255U) {
 			div_completed = true;
@@ -108,6 +118,7 @@ static int i2c_sam_twihs_configure(const struct device *dev, uint32_t config)
 	struct i2c_sam_twihs_dev_data *const dev_data = dev->data;
 	Twihs *const twihs = dev_cfg->regs;
 	uint32_t bitrate;
+	uint32_t mck_hz;
 	int ret;
 
 #if 1	// Bringup Debug
@@ -145,8 +156,17 @@ static int i2c_sam_twihs_configure(const struct device *dev, uint32_t config)
 
 	k_sem_take(&dev_data->lock, K_FOREVER);
 
+	dev_data->current_bitrate = bitrate;
+
 	/* Setup clock waveform */
-	ret = i2c_clk_set(twihs, bitrate);
+	ret = clock_control_get_rate(SAM_DT_PMC_CONTROLLER,
+				     (clock_control_subsys_t)&dev_cfg->clock_cfg,
+				     &mck_hz);
+	if (ret < 0) {
+		LOG_ERR("Failed to get I2C clock rate, err=%d", ret);
+		goto unlock;
+	}
+	ret = i2c_clk_set(twihs, mck_hz, bitrate);
 	if (ret < 0) {
 		goto unlock;
 	}
@@ -233,13 +253,18 @@ static int i2c_sam_twihs_transfer(const struct device *dev,
 #else
 		/* Wait for the transfer to complete */
 		if (k_sem_take(&dev_data->sem, K_MSEC(100)) != 0) {
+				uint32_t tmck_hz;
 				LOG_ERR("%s: I2C transfer timeout, recovering bus", dev->name);
 				/* Disable all TWIHS interrupts before reset */
 				twihs->TWIHS_IDR = 0xFFFFFFFF;
 				/* Software reset clears master mode and clock config */
 				twihs->TWIHS_CR = TWIHS_CR_SWRST;
 				/* Re-initialize: restore clock, slave-disable, master-enable */
-				i2c_clk_set(twihs, dev_cfg->bitrate);
+				if (clock_control_get_rate(SAM_DT_PMC_CONTROLLER,
+							   (clock_control_subsys_t)&dev_cfg->clock_cfg,
+							   &tmck_hz) == 0) {
+					i2c_clk_set(twihs, tmck_hz, dev_data->current_bitrate);
+				}
 				twihs->TWIHS_CR = TWIHS_CR_SVDIS;
 				twihs->TWIHS_CR = TWIHS_CR_MSEN;
 				k_sem_give(&dev_data->lock);
@@ -350,6 +375,8 @@ static int i2c_sam_twihs_initialize(const struct device *dev)
 	/* Reset the module */
 	twihs->TWIHS_CR = TWIHS_CR_SWRST;
 
+	dev_data->current_bitrate = dev_cfg->bitrate;
+
 	bitrate_cfg = i2c_map_dt_bitrate(dev_cfg->bitrate);
 
 	ret = i2c_sam_twihs_configure(dev, I2C_MODE_CONTROLLER | bitrate_cfg);
@@ -383,7 +410,16 @@ static int i2c_sam_twihs_recover_bus(const struct device *dev)
 	twihs->TWIHS_IDR = 0xFFFFFFFF;
 	twihs->TWIHS_CR  = TWIHS_CR_SWRST;
 
-	ret = i2c_clk_set(twihs, dev_cfg->bitrate);
+	uint32_t mck_hz;
+	ret = clock_control_get_rate(SAM_DT_PMC_CONTROLLER,
+				     (clock_control_subsys_t)&dev_cfg->clock_cfg,
+				     &mck_hz);
+	if (ret < 0) {
+		LOG_ERR("Failed to get I2C clock rate");
+		k_sem_give(&dev_data->lock);
+		return ret;
+	}
+	ret = i2c_clk_set(twihs, mck_hz, dev_data->current_bitrate);
 	twihs->TWIHS_CR = TWIHS_CR_SVDIS;
 	twihs->TWIHS_CR = TWIHS_CR_MSEN;
 
