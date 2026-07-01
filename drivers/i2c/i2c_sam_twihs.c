@@ -158,6 +158,10 @@ static int i2c_sam_twihs_configure(const struct device *dev, uint32_t config)
 
 	dev_data->current_bitrate = bitrate;
 
+	/* Reset state machine before CWGR update — safe under lock (no transfer in flight). */
+	twihs->TWIHS_IDR = 0xFFFFFFFF;
+	twihs->TWIHS_CR  = TWIHS_CR_SWRST;
+
 	/* Setup clock waveform */
 	ret = clock_control_get_rate(SAM_DT_PMC_CONTROLLER,
 				     (clock_control_subsys_t)&dev_cfg->clock_cfg,
