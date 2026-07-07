@@ -220,6 +220,42 @@ static void read_msg_start(Twihs *const twihs, struct twihs_msg *msg,
 	twihs->TWIHS_IER = TWIHS_IER_RXRDY | TWIHS_IER_TXCOMP | TWIHS_IER_NACK;
 }
 
+/* Register-read via internal-address hardware path (BUG-011 fix).
+ *
+ * Routes write(reg_addr, 1-3 bytes)+read pairs through TWIHS_IADRSZ so the
+ * hardware generates the Sr (repeated START) internally.  The alternative
+ * two-message path — write exits on TXRDY with no STOP, then explicit
+ * TWIHS_CR_START for Sr — stalls mid-START on the SAM S70: SDA falls (Sr
+ * begins) but SCL never clocks (SR.SCL_LVL=1, SDA_LVL=0 at timeout).
+ *
+ * Caller must set dev_data->msg to the read message before calling.
+ * IADR byte order: buf[0] is the first byte sent on the wire (MSB in IADR
+ * for multi-byte addresses, per SAM datasheet §54.6.2).
+ */
+static void iadrsz_read_start(Twihs *const twihs, struct twihs_msg *msg,
+			      uint8_t daddr,
+			      const uint8_t *reg_buf, uint8_t reg_len)
+{
+	uint32_t iadr = 0U;
+
+	for (uint8_t k = 0U; k < reg_len; k++) {
+		iadr = (iadr << 8) | reg_buf[k];
+	}
+	twihs->TWIHS_IADR = iadr;
+
+	twihs->TWIHS_MMR = TWIHS_MMR_MREAD | TWIHS_MMR_DADR(daddr)
+			   | TWIHS_MMR_IADRSZ(reg_len);
+
+	uint32_t cr = TWIHS_CR_START;
+
+	if (msg->len == 1U) {
+		cr |= TWIHS_CR_STOP;
+	}
+	twihs->TWIHS_CR = cr;
+
+	twihs->TWIHS_IER = TWIHS_IER_RXRDY | TWIHS_IER_TXCOMP | TWIHS_IER_NACK;
+}
+
 static int i2c_sam_twihs_transfer(const struct device *dev,
 				  struct i2c_msg *msgs,
 				  uint8_t num_msgs, uint16_t addr)
@@ -247,7 +283,24 @@ static int i2c_sam_twihs_transfer(const struct device *dev,
 		dev_data->msg.idx = 0U;
 		dev_data->msg.twihs_sr = 0U;
 		dev_data->msg.flags = msgs[i].flags;
-		if ((msgs[i].flags & I2C_MSG_RW_MASK) == I2C_MSG_READ) {
+
+		if ((i + 1 < num_msgs) &&
+		    ((msgs[i].flags & I2C_MSG_RW_MASK) == I2C_MSG_WRITE) &&
+		    !(msgs[i].flags & I2C_MSG_STOP) &&
+		    (msgs[i].len >= 1U) && (msgs[i].len <= 3U) &&
+		    ((msgs[i + 1].flags & I2C_MSG_RW_MASK) == I2C_MSG_READ)) {
+			/* Register-read: collapse write+read into one IADRSZ
+			 * hardware transaction to avoid the explicit-START Sr
+			 * stall (BUG-011). Track the read message in dev_data. */
+			dev_data->msg.buf   = msgs[i + 1].buf;
+			dev_data->msg.len   = msgs[i + 1].len;
+			dev_data->msg.idx   = 0U;
+			dev_data->msg.twihs_sr = 0U;
+			dev_data->msg.flags = msgs[i + 1].flags;
+			iadrsz_read_start(twihs, &dev_data->msg, addr,
+					  msgs[i].buf, (uint8_t)msgs[i].len);
+			i++;
+		} else if ((msgs[i].flags & I2C_MSG_RW_MASK) == I2C_MSG_READ) {
 			read_msg_start(twihs, &dev_data->msg, addr);
 		} else {
 			write_msg_start(twihs, &dev_data->msg, addr);
