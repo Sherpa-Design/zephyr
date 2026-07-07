@@ -70,6 +70,7 @@ struct i2c_sam_twihs_dev_data {
 	struct k_sem sem;
 	struct twihs_msg msg;
 	uint32_t current_bitrate;
+	volatile uint32_t isr_count; /* diagnostic: incremented at ISR entry */
 };
 
 static int i2c_clk_set(Twihs *const twihs, uint32_t mck_hz, uint32_t speed)
@@ -256,8 +257,20 @@ static int i2c_sam_twihs_transfer(const struct device *dev,
 		k_sem_take(&dev_data->sem, K_FOREVER);
 #else
 		/* Wait for the transfer to complete */
+		LOG_WRN("%s: xfer addr=0x%02x nvic_en=%u imr=0x%08x isr_n=%u",
+			dev->name, addr,
+			(unsigned)irq_is_enabled(dev_cfg->irq_id),
+			(unsigned)twihs->TWIHS_IMR,
+			(unsigned)dev_data->isr_count);
 		if (k_sem_take(&dev_data->sem, K_MSEC(100)) != 0) {
 				uint32_t tmck_hz;
+				LOG_ERR("%s: DIAG timeout nvic_en=%u nvic_pend=%u imr=0x%08x sr=0x%08x isr_n=%u",
+					dev->name,
+					(unsigned)irq_is_enabled(dev_cfg->irq_id),
+					(unsigned)NVIC_GetPendingIRQ(dev_cfg->irq_id),
+					(unsigned)twihs->TWIHS_IMR,
+					(unsigned)twihs->TWIHS_SR,
+					(unsigned)dev_data->isr_count);
 				LOG_ERR("%s: I2C transfer timeout, recovering bus", dev->name);
 				/* Disable all TWIHS interrupts before reset */
 				twihs->TWIHS_IDR = 0xFFFFFFFF;
@@ -295,6 +308,8 @@ static void i2c_sam_twihs_isr(const struct device *dev)
 	Twihs *const twihs = dev_cfg->regs;
 	struct twihs_msg *msg = &dev_data->msg;
 	uint32_t isr_status;
+
+	dev_data->isr_count++; /* diagnostic */
 
 	/* Retrieve interrupt status */
 	isr_status = twihs->TWIHS_SR & twihs->TWIHS_IMR;
