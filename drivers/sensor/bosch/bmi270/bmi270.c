@@ -779,14 +779,16 @@ static int bmi270_init(const struct device *dev)
 		return ret;
 	}
 #endif
-#if 0	/* Do not re-enable ADV_PWR_SAVE — causes I2C timeouts on SAME70 TWIHS */
+	/* Enable APS after all config writes complete — no further writes occur
+	 * during normal operation (sample_fetch is read-only). The 1000 µs delay
+	 * in bmi270_reg_write_with_delay satisfies Bosch's 450 µs inter-write
+	 * minimum. attr_set() already guards with BMI270_TRANSC_DELAY_SUSPEND. */
 	adv_pwr_save = BMI270_SET_BITS_POS_0(adv_pwr_save,
 					     BMI270_PWR_CONF_ADV_PWR_SAVE,
 					     BMI270_PWR_CONF_ADV_PWR_SAVE_EN);
 	ret = bmi270_reg_write_with_delay(dev, BMI270_REG_PWR_CONF,
 					  &adv_pwr_save, 1,
 					  BMI270_INTER_WRITE_DELAY_US);
-#endif
 	return ret;
 }
 
