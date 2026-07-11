@@ -310,7 +310,7 @@ static int i2c_sam_twihs_transfer(const struct device *dev,
 		k_sem_take(&dev_data->sem, K_FOREVER);
 #else
 		/* Wait for the transfer to complete */
-		LOG_WRN("%s: xfer addr=0x%02x nvic_en=%u imr=0x%08x isr_n=%u",
+		LOG_DBG("%s: xfer addr=0x%02x nvic_en=%u imr=0x%08x isr_n=%u",
 			dev->name, addr,
 			(unsigned)irq_is_enabled(dev_cfg->irq_id),
 			(unsigned)twihs->TWIHS_IMR,
