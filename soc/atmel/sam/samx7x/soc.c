@@ -160,7 +160,8 @@ void soc_reset_hook(void)
 	 *            derives an address from a tag, so it is safe on random RAM.
 	 *
 	 * DC=1 with random cache RAM is impossible (losing power forces DC=0), so
-	 * the two arms are exhaustive.  See veet_zephyr handoff doc section 10.
+	 * the two arms are exhaustive.  See this fork's README.md for the full
+	 * two-cache-state rationale.
 	 */
 	if (SCB->CCR & SCB_CCR_DC_Msk) {
 		SCB_DisableDCache();     /* DC=1: clean+invalidate, preserves dirty LR */

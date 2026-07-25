@@ -116,7 +116,7 @@ static int atmel_sam_clock_control_get_rate(const struct device *dev,
 #endif
 
 		/* MAINCK from PLLA Kconfig + DTS cpu0.clock-frequency.
-		 * Assumes PRES/MDIV match their Kconfig values (true for SAMX7X/VEET
+		 * Assumes PRES/MDIV match their Kconfig values (true for SAMX7X
 		 * where neither field changes after SOC init). */
 		const uint32_t mainck_hz =
 			(uint32_t)((uint64_t)SOC_ATMEL_SAM_HCLK_FREQ_HZ
