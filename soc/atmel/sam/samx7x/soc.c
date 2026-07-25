@@ -140,17 +140,33 @@ void soc_reset_hook(void)
 	__ISB();
 
 	/*
-	 * D-cache may be enabled from a prior stage (e.g. MCUboot).  Use
-	 * SCB_DisableDCache() only — it performs DCCISW (clean+invalidate,
-	 * i.e. write-back then discard) on every set/way before clearing
-	 * CCR.DC.  SCB_InvalidateDCache() (DCISW, discard without writeback)
-	 * must NOT be called first: the push {r4,r5,r6,lr} at function entry
-	 * wrote the return address into the D-cache (write-back policy);
-	 * calling DCISW before DCCISW discards that dirty line without
-	 * writing LR to SRAM, so the subsequent pop {pc} fetches stale
-	 * MCUboot data from SRAM and jumps to a garbage address.
+	 * Cortex-M7 L1 D-cache maintenance.  soc_reset_hook() is entered under TWO
+	 * cache states and the correct op differs — branch on CCR.DC:
+	 *
+	 *   DC=1  -> warm soft-jump (bootloader -> app; jump_to_app leaves D-cache
+	 *            ENABLED on handoff).  The prologue push {r4,r5,r6,lr} wrote the
+	 *            return address into a DIRTY, write-back D-cache line not yet in
+	 *            SRAM.  Must CLEAN+invalidate (DCCISW, via SCB_DisableDCache) to
+	 *            flush LR to SRAM before disabling, or the epilogue pop {pc}
+	 *            fetches stale SRAM and jumps to a garbage address.
+	 *
+	 *   DC=0  -> hardware reset (POR / backup-exit VROFF / SYSRESETREQ).  Cache
+	 *            was off, so the prologue push went straight to SRAM (LR safe).
+	 *            After a backup-exit the cache RAM lost power and comes up with
+	 *            RANDOM tag/valid/dirty bits: a clean-by-set/way (DCCISW) would
+	 *            read random tags and scatter random data to random SRAM
+	 *            addresses (corruption -> mpsc_pbuf/log_buffer HardFault on the
+	 *            bootloader wake).  Must INVALIDATE-only (DCISW) — it never
+	 *            derives an address from a tag, so it is safe on random RAM.
+	 *
+	 * DC=1 with random cache RAM is impossible (losing power forces DC=0), so
+	 * the two arms are exhaustive.  See veet_zephyr handoff doc section 10.
 	 */
-	SCB_DisableDCache();
+	if (SCB->CCR & SCB_CCR_DC_Msk) {
+		SCB_DisableDCache();     /* DC=1: clean+invalidate, preserves dirty LR */
+	} else {
+		SCB_InvalidateDCache();  /* DC=0: invalidate-only, safe on random RAM */
+	}
 
 	/*
 	 * I-cache invalidation sequence for Cortex-M7 (SAM S70):
