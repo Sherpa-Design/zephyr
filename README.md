@@ -74,3 +74,24 @@ for details:
   at 150 MHz).
 - **SoC startup** — DTCM/ITCM enable, WDT/RSTC errata handling, AHBS arbitration.
 - **BMI270** — re-enable Advanced Power Save after init.
+
+---
+
+## Maintenance note — before upstreaming or re-cutting this branch
+
+This is a downstream **topic branch** based off Zephyr 4.4.0 (`684c9e8f32e`); it is
+never merged to any `main`. When these fixes are upstreamed or the branch is
+reorganized, **re-cut a fresh branch from a clean base** — re-author or cherry-pick
+the changes into individual, upstream-ready commits — rather than force-pushing a
+rewritten history over the live branch. A topic branch's end-of-life is the safe,
+**non-destructive** point to tidy up, with no risk to the work.
+
+Two things to genericize during that re-cut (cosmetic only — the current *tree* is
+already platform-neutral):
+
+- a few **early commit subjects/bodies** still carry downstream product-specific
+  naming;
+- the **branch name** still carries a downstream product prefix.
+
+Fold both into the re-cut, built alongside from a known-good base, so the work is
+never at risk.
