@@ -305,25 +305,25 @@ static int i2c_sam_twihs_transfer(const struct device *dev,
 		} else {
 			write_msg_start(twihs, &dev_data->msg, addr);
 		}
-		/* Wait for the transfer to complete */
-#if 0
-		k_sem_take(&dev_data->sem, K_FOREVER);
-#else
-		/* Wait for the transfer to complete */
-		LOG_DBG("%s: xfer addr=0x%02x nvic_en=%u imr=0x%08x isr_n=%u",
-			dev->name, addr,
-			(unsigned)irq_is_enabled(dev_cfg->irq_id),
-			(unsigned)twihs->TWIHS_IMR,
-			(unsigned)dev_data->isr_count);
-		if (k_sem_take(&dev_data->sem, K_MSEC(100)) != 0) {
+		/* Wait for the transfer to complete — BUSY-POLL, not a yielding
+		 * k_sem_take().  TEST (BUG-024 / PMC Wait mode): a yielding take lets the
+		 * idle thread WFI into Wait mode, which gates MCK and stalls the in-flight
+		 * TWIHS transfer (the TXCOMP ISR never fires) -> 100 ms timeout + SWRST.
+		 * Spinning keeps the CPU active so MCK stays alive and the transfer
+		 * completes; the ISR still moves the bytes and gives the sem.  Transfers
+		 * are ~microseconds; long sensor integration waits elsewhere still enter
+		 * Wait mode normally.  LARGE BLAST RADIUS (every I2C device) — test only,
+		 * pending Opus review. */
+		bool i2c_timed_out = true;
+		int64_t i2c_t0 = k_uptime_get();
+		do {
+			if (k_sem_take(&dev_data->sem, K_NO_WAIT) == 0) {
+				i2c_timed_out = false;
+				break;
+			}
+		} while ((k_uptime_get() - i2c_t0) < 100);
+		if (i2c_timed_out) {
 				uint32_t tmck_hz;
-				LOG_ERR("%s: DIAG timeout nvic_en=%u nvic_pend=%u imr=0x%08x sr=0x%08x isr_n=%u",
-					dev->name,
-					(unsigned)irq_is_enabled(dev_cfg->irq_id),
-					(unsigned)NVIC_GetPendingIRQ(dev_cfg->irq_id),
-					(unsigned)twihs->TWIHS_IMR,
-					(unsigned)twihs->TWIHS_SR,
-					(unsigned)dev_data->isr_count);
 				LOG_ERR("%s: I2C transfer timeout, recovering bus", dev->name);
 				/* Disable all TWIHS interrupts before reset */
 				twihs->TWIHS_IDR = 0xFFFFFFFF;
@@ -340,7 +340,6 @@ static int i2c_sam_twihs_transfer(const struct device *dev,
 				k_sem_give(&dev_data->lock);
 				return -ETIMEDOUT;
 		}
-#endif
 		if (dev_data->msg.twihs_sr > 0) {
 			/* Something went wrong */
 			ret = -EIO;
