@@ -49,6 +49,10 @@
 #define MMC_SWITCH_CACHE_ON_ARG                                                                    \
 	(0xFC000000 & (0U << 26)) + (0x03000000 & (0b11 << 24)) + (0x00FF0000 & (33U << 16)) +     \
 		(0x0000FF00 & (1U << 8)) + (0x000000F7 & (0U << 3)) + (0x00000000 & (3U << 0))
+/* VEET fork (BUG-027): CACHE_CTRL (EXT_CSD[33]) = 0 -> write-through, cache disabled. */
+#define MMC_SWITCH_CACHE_OFF_ARG                                                                   \
+	(0xFC000000 & (0U << 26)) + (0x03000000 & (0b11 << 24)) + (0x00FF0000 & (33U << 16)) +     \
+		(0x0000FF00 & (0U << 8)) + (0x000000F7 & (0U << 3)) + (0x00000000 & (3U << 0))
 
 LOG_MODULE_DECLARE(sd, CONFIG_SD_LOG_LEVEL);
 
@@ -620,18 +624,25 @@ static int mmc_set_cache(struct sd_card *card, struct mmc_ext_csd *card_ext_csd)
 	int ret = 0;
 	struct sdhc_command cmd = {0};
 
-	/* If there is no cache, don't use cache */
+	/* If there is no cache, nothing to manage */
 	if (card_ext_csd->cache_size == 0) {
 		return 0;
 	}
-	/* CMD6 to write to EXT CSD to turn on cache */
+	/* VEET fork (BUG-027): DISABLE the on-card write-back cache — do NOT enable it.
+	 * Upstream enables it unconditionally (correct for a phone, WRONG for a power-loss-
+	 * sensitive logger): this SD subsystem never issues FLUSH_CACHE, so fs_sync would not
+	 * reach NAND, and VEET's brownout backstop (a register-only SM ISR) structurally
+	 * cannot flush — FLUSH_CACHE is a CMD6 bus transaction it can't issue. Write-through
+	 * is mandatory. This must stay in the init path: it runs on every re-init including
+	 * post-RST_n and backup re-mount, so the cache never silently re-enables. CACHE_CTRL=0
+	 * also flushes any data already present. Matches the FW2.2.4 (cache-off) baseline. */
 	cmd.opcode = SD_SWITCH;
-	cmd.arg = MMC_SWITCH_CACHE_ON_ARG;
+	cmd.arg = MMC_SWITCH_CACHE_OFF_ARG;
 	cmd.response_type = SD_RSP_TYPE_R1b;
 	cmd.timeout_ms = CONFIG_SD_CMD_TIMEOUT;
 	ret = sdhc_request(card->sdhc, &cmd, NULL);
 	if (ret) {
-		LOG_DBG("Error turning on card cache: %d", ret);
+		LOG_DBG("Error disabling card cache: %d", ret);
 		return ret;
 	}
 	ret = sdmmc_wait_ready(card);
